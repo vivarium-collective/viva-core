@@ -6,5 +6,6 @@ pub mod codec;
 pub mod doc;
 pub mod grammar;
 pub mod registry;
+pub mod rng;
 pub mod state;
 pub mod types;
