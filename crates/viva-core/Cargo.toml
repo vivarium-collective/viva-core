@@ -13,6 +13,13 @@ crate-type = ["cdylib", "rlib"]
 test = false
 doctest = false
 
+[features]
+# Native metabolism FBA solve links GLPK (a hard C dependency). OFF by default
+# so the wheel builds without GLPK; enable with `maturin develop --features glpk`
+# (GLPK headers/lib at /opt/homebrew, overridable via GLPK_LIB_DIR). build.rs
+# only emits link flags when this feature is on.
+glpk = []
+
 [dependencies]
 bigraph-schema-rs = { path = "../bigraph-schema-rs" }
 process-bigraph-rs = { path = "../process-bigraph-rs" }
