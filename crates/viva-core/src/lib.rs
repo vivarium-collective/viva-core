@@ -38,7 +38,24 @@ use pyproc::PyProcess;
 /// Numpy dtypes of every tagged structured store, keyed by absolute store path.
 /// Used to rebuild bulk/unique views with the exact field dtypes the real `.pbg`
 /// carried (e.g. `_entryState` as `int8`, so `attrs`' `.view(bool)` works).
-pub type DtypeMap = HashMap<Vec<String>, Vec<(String, String)>>;
+#[derive(Default)]
+pub struct DtypeMap {
+    dtypes: HashMap<Vec<String>, Vec<(String, String)>>,
+    /// Prebuilt numpy `id` array per bulk store (immutable for a run).
+    pub ids: HashMap<Vec<String>, Py<PyAny>>,
+}
+
+impl DtypeMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn get(&self, path: &[String]) -> Option<&Vec<(String, String)>> {
+        self.dtypes.get(path)
+    }
+    pub fn insert(&mut self, path: Vec<String>, d: Vec<(String, String)>) {
+        self.dtypes.insert(path, d);
+    }
+}
 
 fn perr(e: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
@@ -124,10 +141,36 @@ fn install_unique_layouts(
     Ok(())
 }
 
+/// Build each bulk store's numpy `id` array once (ids never change in a run).
+fn collect_bulk_ids(
+    py: Python<'_>,
+    m: &Map<StoreNode>,
+    path: &mut Vec<String>,
+    out: &mut DtypeMap,
+) -> PyResult<()> {
+    for (k, n) in m {
+        path.push(k.clone());
+        match n {
+            StoreNode::Branch(b) => collect_bulk_ids(py, b, path, out)?,
+            StoreNode::Bulk(b) => {
+                let arr = convert::build_bulk_ids(py, &b.ids)?;
+                out.ids.insert(path.clone(), arr.unbind());
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
 fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
-    let dtypes = Arc::new(collect_dtypes(spec));
+    let mut dtype_map = collect_dtypes(spec);
     let mut state = from_initial(spec);
-    Python::attach(|py| install_unique_layouts(py, &mut state.root, &mut Vec::new(), &dtypes))?;
+    Python::attach(|py| -> PyResult<()> {
+        collect_bulk_ids(py, &state.root, &mut Vec::new(), &mut dtype_map)?;
+        install_unique_layouts(py, &mut state.root, &mut Vec::new(), &dtype_map)
+    })?;
+    let dtypes = Arc::new(dtype_map);
 
     let mut registry = ProcessRegistry::with_builtin_emitters();
     let mut addresses: Vec<String> = Vec::new();
