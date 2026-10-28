@@ -23,8 +23,9 @@ use crate::process::{wire_path, PortUpdate, PortView, Process, ProcessError, Row
 use crate::registry::ProcessRegistry;
 use crate::schedule::{wire_step_layers, Layer};
 use bigraph_schema_rs::apply::{apply_update, reconcile, ApplyError, Update};
-use bigraph_schema_rs::doc::{CompositeSpec, Map, Value};
+use bigraph_schema_rs::doc::{CompositeSpec, Map, ProcessEdge, Value};
 use bigraph_schema_rs::state::{from_initial, State, StoreNode};
+use std::collections::HashMap as StdHashMap;
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +101,39 @@ impl Engine {
         state: State,
         registry: &ProcessRegistry,
     ) -> Result<Self, EngineError> {
+        Self::build(spec, state, |_path, e| {
+            registry.create(&e.address, e.config.as_ref())
+        })
+    }
+
+    /// Milestone-4 seam: schedule ALREADY-CONSTRUCTED processes (keyed by their
+    /// absolute edge path) instead of constructing every edge from a JSON
+    /// `address`+`cfg`. This is the Python->Rust composite handoff: an edge whose
+    /// path is in `prebuilt` is driven by that pre-built instance (an
+    /// instance-bound [`crate::process::Process`], carrying live `sim_data`); any
+    /// edge NOT in `prebuilt` (e.g. the emitter) falls back to `registry`. Wiring,
+    /// intervals, gating and step-layer order are taken from `spec` exactly as in
+    /// [`with_state`], so a prebuilt run and a JSON run of the same composite
+    /// schedule identically.
+    pub fn with_prebuilt(
+        spec: &CompositeSpec,
+        state: State,
+        registry: &ProcessRegistry,
+        mut prebuilt: StdHashMap<Vec<String>, Box<dyn Process>>,
+    ) -> Result<Self, EngineError> {
+        Self::build(spec, state, |path, e| match prebuilt.remove(path) {
+            Some(p) => Ok(p),
+            None => registry.create(&e.address, e.config.as_ref()),
+        })
+    }
+
+    /// Shared construction for [`with_state`] / [`with_prebuilt`]: iterate the
+    /// spec's edges in document order, obtaining each edge's [`Process`] via
+    /// `make`, and sort them into processes vs steps with their wiring + interval.
+    fn build<F>(spec: &CompositeSpec, state: State, mut make: F) -> Result<Self, EngineError>
+    where
+        F: FnMut(&[String], &ProcessEdge) -> Result<Box<dyn Process>, ProcessError>,
+    {
         let layers = wire_step_layers(spec);
         let (mut processes, mut steps) = (Vec::new(), Vec::new());
         for (path, e) in spec.edges() {
@@ -110,7 +144,7 @@ impl Engine {
             };
             let slot = Slot {
                 base: path[..path.len() - 1].to_vec(),
-                process: registry.create(&e.address, e.config.as_ref())?,
+                process: make(&path, e)?,
                 inputs: wires(&e.inputs),
                 outputs: wires(&e.outputs),
                 interval,

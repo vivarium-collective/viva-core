@@ -58,9 +58,26 @@ impl PyProcess {
             .call1((cfg_py,))
             .map_err(|e| proc_err(format!("instantiating {cls}: {e}")))?;
 
+        Self::from_instance(instance, dtypes, cls.to_string())
+    }
+
+    /// Bind an ALREADY-CONSTRUCTED Python process/step instance (M4 `run_prebuilt`).
+    ///
+    /// Unlike [`create`], this does NOT import a class or re-run `__init__` from a
+    /// JSON `cfg`: it drives the exact instance the caller hands over. That is the
+    /// whole point of the Python->Rust composite handoff — the baseline's 11
+    /// process types carry live, non-JSON-serializable `sim_data` handles baked in
+    /// at construction, so the engine must schedule the pre-built instance itself.
+    /// The per-tick driving (view build, gate, `update`, delta translation) is
+    /// identical to [`create`]'s — only the construction source differs.
+    pub fn from_instance(
+        instance: Bound<'_, PyAny>,
+        dtypes: Arc<DtypeMap>,
+        name: String,
+    ) -> Result<Self, ProcessError> {
         let outputs = instance
             .call_method0("outputs")
-            .map_err(|e| proc_err(format!("{cls}.outputs(): {e}")))?;
+            .map_err(|e| proc_err(format!("{name}.outputs(): {e}")))?;
         let out_schema = parse_out_schema(&outputs).map_err(proc_err)?;
 
         let has_perform_update = attr_is_callable(&instance, "perform_update");
@@ -72,7 +89,7 @@ impl PyProcess {
             has_perform_update,
             has_calculate_timestep,
             dtypes,
-            name: cls.to_string(),
+            name,
         })
     }
 }
