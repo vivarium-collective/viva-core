@@ -94,6 +94,25 @@ def _is_edge(v):
     return isinstance(v, dict) and "address" in v and ("inputs" in v or "outputs" in v)
 
 
+def _address_str(address):
+    """Normalize an edge address to its ``protocol:data`` string. A realized
+    ``Composite`` leaves some edges (e.g. ``shape_step``) with the parsed form
+    ``{'protocol': 'local', 'data': 'ShapeStep'}``."""
+    if isinstance(address, dict):
+        return f"{address['protocol']}:{address['data']}"
+    return address
+
+
+def _unwrap_state(state, path=()):
+    """Accept a realized ``process_bigraph.Composite`` (its ``.state``) or a state
+    dict, then descend ``path`` (e.g. ``("agents", "0")``)."""
+    if hasattr(state, "state") and not isinstance(state, dict):
+        state = state.state
+    for key in path:
+        state = state[key]
+    return state
+
+
 def _is_emitter(address):
     return (
         "Emitter" in address
@@ -162,8 +181,13 @@ def _native_config_from_instance(edge):
     return {k: _serialize(v) for k, v in params.items()}
 
 
-def build_payload(state, native_addresses=None):
+def build_payload(state, native_addresses=None, path=()):
     """Split a realized composite state into the ``run_prebuilt`` arguments.
+
+    ``state`` may be a realized ``process_bigraph.Composite`` (preferred: every edge
+    carries a live ``instance``) or a state dict; ``path`` descends to the agent
+    sub-state (e.g. ``("agents", "0")``). A raw ``baseline()`` doc is NOT realized
+    and raises ``ValueError`` on the first edge lacking an instance.
 
     Returns ``(processes, topology_json, state_json, handles)``:
       * ``processes``: ``{edge_name: instance}`` for every non-emitter edge;
@@ -178,6 +202,7 @@ def build_payload(state, native_addresses=None):
         tuple) and ``["allocator_rng"]`` (the ``RandomState``) — passed by
         reference so the Rust engine never serializes them (Option 1).
     """
+    state = _unwrap_state(state, path)
     native = set(native_addresses or ())
     edges = {k: v for k, v in state.items() if _is_edge(v)}
     stores = {k: v for k, v in state.items() if not _is_edge(v)}
@@ -185,7 +210,7 @@ def build_payload(state, native_addresses=None):
     processes = {}
     topology = {}
     for name, edge in edges.items():
-        address = edge["address"]
+        address = _address_str(edge["address"])
         node = {
             "_type": edge.get("_type", "step"),
             "address": address,
@@ -216,7 +241,7 @@ def build_payload(state, native_addresses=None):
     return processes, json.dumps(topology), state_json, handles
 
 
-def run_from_state(state, n_ticks, native_addresses=None):
+def run_from_state(state, n_ticks, native_addresses=None, path=()):
     """Run a realized composite state on the Rust engine via the handoff.
 
     ``state`` is a realized composite state dict (edges carry ``instance``);
@@ -225,7 +250,7 @@ def run_from_state(state, n_ticks, native_addresses=None):
     each such edge's native config is sourced from its live instance.
     Returns the decoded final state dict.
     """
-    processes, topology_json, state_json, handles = build_payload(state, native_addresses)
+    processes, topology_json, state_json, handles = build_payload(state, native_addresses, path)
     return viva_core.run_prebuilt(
         processes, topology_json, state_json, n_ticks, native_addresses, handles
     )
