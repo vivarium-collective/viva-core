@@ -1,0 +1,14 @@
+# Rust
+/target
+**/target
+Cargo.lock
+# Python / maturin
+.venv*
+__pycache__/
+*.so
+*.pyc
+dist/
+*.egg-info/
+# scratch
+/out
+.superpowers/
