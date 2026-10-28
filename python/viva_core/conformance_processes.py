@@ -52,6 +52,28 @@ class BenchScalarProcess(EcoliProcess):
         return {"value": 1.0}
 
 
+class TickTrigger(EcoliProcess):
+    """Fixed-timestep driver that re-writes `timestep` (same value) every tick,
+    so a v2ecoli Step reading `timestep` (e.g. ProteinDegradation) is re-triggered
+    each scheduler iteration under BOTH engines (a Step runs reactively, not on an
+    interval)."""
+
+    name = "tick_trigger"
+    config_schema = {}
+
+    def inputs(self):
+        return {}
+
+    def outputs(self):
+        return {"timestep": "overwrite[integer]"}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        return {"timestep": int(self.parameters.get("value", 1))}
+
+
 class BenchBulkProcess(EcoliProcess):
     """A fixed-timestep bulk evolver for the day-one benchmark: it runs EVERY
     tick (constant `calculate_timestep`), reads the whole `bulk` structured

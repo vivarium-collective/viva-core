@@ -29,6 +29,9 @@ use process_bigraph_rs::process::Process;
 use process_bigraph_rs::registry::ProcessRegistry;
 
 mod convert;
+#[cfg(feature = "glpk")]
+mod glpk;
+mod processes;
 mod pyproc;
 mod rust_process;
 
@@ -37,7 +40,24 @@ use pyproc::PyProcess;
 /// Numpy dtypes of every tagged structured store, keyed by absolute store path.
 /// Used to rebuild bulk/unique views with the exact field dtypes the real `.pbg`
 /// carried (e.g. `_entryState` as `int8`, so `attrs`' `.view(bool)` works).
-pub type DtypeMap = HashMap<Vec<String>, Vec<(String, String)>>;
+#[derive(Default)]
+pub struct DtypeMap {
+    dtypes: HashMap<Vec<String>, Vec<(String, String)>>,
+    /// Prebuilt numpy `id` array per bulk store (immutable for a run).
+    pub ids: HashMap<Vec<String>, Py<PyAny>>,
+}
+
+impl DtypeMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn get(&self, path: &[String]) -> Option<&Vec<(String, String)>> {
+        self.dtypes.get(path)
+    }
+    pub fn insert(&mut self, path: Vec<String>, d: Vec<(String, String)>) {
+        self.dtypes.insert(path, d);
+    }
+}
 
 fn perr(e: impl std::fmt::Display) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
@@ -123,10 +143,36 @@ fn install_unique_layouts(
     Ok(())
 }
 
+/// Build each bulk store's numpy `id` array once (ids never change in a run).
+fn collect_bulk_ids(
+    py: Python<'_>,
+    m: &Map<StoreNode>,
+    path: &mut Vec<String>,
+    out: &mut DtypeMap,
+) -> PyResult<()> {
+    for (k, n) in m {
+        path.push(k.clone());
+        match n {
+            StoreNode::Branch(b) => collect_bulk_ids(py, b, path, out)?,
+            StoreNode::Bulk(b) => {
+                let arr = convert::build_bulk_ids(py, &b.ids)?;
+                out.ids.insert(path.clone(), arr.unbind());
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
 fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
-    let dtypes = Arc::new(collect_dtypes(spec));
+    let mut dtype_map = collect_dtypes(spec);
     let mut state = from_initial(spec);
-    Python::attach(|py| install_unique_layouts(py, &mut state.root, &mut Vec::new(), &dtypes))?;
+    Python::attach(|py| -> PyResult<()> {
+        collect_bulk_ids(py, &state.root, &mut Vec::new(), &mut dtype_map)?;
+        install_unique_layouts(py, &mut state.root, &mut Vec::new(), &dtype_map)
+    })?;
+    let dtypes = Arc::new(dtype_map);
 
     let mut registry = ProcessRegistry::with_builtin_emitters();
     let mut addresses: Vec<String> = Vec::new();
@@ -136,6 +182,12 @@ fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
         }
     }
     for address in addresses {
+        // Native (all-Rust) twin, when enabled by VIVA_NATIVE_PROCESSES: same
+        // address, registered INSTEAD of the PyProcess fallback.
+        if let Some(ctor) = processes::native_ctor(&address) {
+            registry.register(&address, ctor);
+            continue;
+        }
         let addr = address.clone();
         let dmap = Arc::clone(&dtypes);
         registry.register(&address, move |cfg| {
@@ -211,10 +263,110 @@ fn run_report(py: Python<'_>, spec: &str, n_ticks: usize) -> PyResult<Py<PyDict>
     Ok(out.unbind())
 }
 
+/// Native-GLPK FBA primitives (only when built `--features glpk`). These expose
+/// the ported metabolism compute core to Python for the bit-identity oracle and
+/// the quadrant-2 benchmark: [`fba_solve`] (the LP solve, bit-identical to
+/// swiglpk) and [`flux_to_bulk_delta`] (flux→integer-count, bit-identical to
+/// `Metabolism._fba_output_to_deltas`).
+#[cfg(feature = "glpk")]
+mod fba_py {
+    use super::*;
+    use bigraph_schema_rs::rng::RandomState;
+    use pyo3::types::PyDict;
+
+    /// Solve one FBA LP via native GLPK with swiglpk-matched parameters.
+    ///
+    /// `lp` keys: `n_rows`, `n_cols` (int); `mat_rows`, `mat_cols` (0-indexed int
+    /// lists) + `mat_vals` (float list) — the sparse constraint matrix, no
+    /// duplicate (row,col); `col_lb`, `col_ub`, `obj` (float lists, ±inf allowed);
+    /// `maximize` (bool). Returns `{status_optimal, objective, col_primals,
+    /// col_duals, row_duals}`.
+    #[pyfunction]
+    pub fn fba_solve(py: Python<'_>, lp: &Bound<'_, PyDict>) -> PyResult<Py<PyDict>> {
+        let get = |k: &str| -> PyResult<Bound<'_, PyAny>> {
+            lp.get_item(k)?
+                .ok_or_else(|| perr(format!("fba_solve: missing LP key {k:?}")))
+        };
+        let n_rows: usize = get("n_rows")?.extract()?;
+        let n_cols: usize = get("n_cols")?.extract()?;
+        let mat_rows: Vec<usize> = get("mat_rows")?.extract()?;
+        let mat_cols: Vec<usize> = get("mat_cols")?.extract()?;
+        let mat_vals: Vec<f64> = get("mat_vals")?.extract()?;
+        let col_lb: Vec<f64> = get("col_lb")?.extract()?;
+        let col_ub: Vec<f64> = get("col_ub")?.extract()?;
+        let obj: Vec<f64> = get("obj")?.extract()?;
+        let maximize: bool = get("maximize")?.extract()?;
+
+        if mat_rows.len() != mat_vals.len() || mat_cols.len() != mat_vals.len() {
+            return Err(perr(
+                "fba_solve: mat_rows/mat_cols/mat_vals length mismatch",
+            ));
+        }
+        let entries = mat_rows
+            .into_iter()
+            .zip(mat_cols)
+            .zip(mat_vals)
+            .map(|((r, c), v)| (r, c, v))
+            .collect();
+        let problem = crate::glpk::Lp {
+            n_rows,
+            n_cols,
+            entries,
+            col_lb,
+            col_ub,
+            obj,
+            maximize,
+        };
+        let sol = crate::glpk::solve(&problem);
+
+        let out = PyDict::new(py);
+        out.set_item("status_optimal", sol.status_optimal)?;
+        out.set_item("objective", sol.objective)?;
+        out.set_item("col_primals", sol.col_primals)?;
+        out.set_item("col_duals", sol.col_duals)?;
+        out.set_item("row_duals", sol.row_duals)?;
+        Ok(out.unbind())
+    }
+
+    /// Flux→integer-bulk-count conversion, bit-identical to
+    /// `Metabolism._fba_output_to_deltas`. Draws one batched `rand` from a fresh
+    /// numpy-parity `RandomState(seed)`. Returns `{counts_final, delta}`.
+    #[pyfunction]
+    pub fn flux_to_bulk_delta(
+        py: Python<'_>,
+        output_molecule_changes: Vec<f64>,
+        counts_init: Vec<i64>,
+        counts_to_molar: f64,
+        seed: u32,
+    ) -> PyResult<Py<PyDict>> {
+        if output_molecule_changes.len() != counts_init.len() {
+            return Err(perr(
+                "flux_to_bulk_delta: output_molecule_changes/counts_init length mismatch",
+            ));
+        }
+        let mut rng = RandomState::new(seed);
+        let (counts_final, delta) = crate::processes::metabolism::flux_to_bulk_delta(
+            &output_molecule_changes,
+            &counts_init,
+            counts_to_molar,
+            &mut rng,
+        );
+        let out = PyDict::new(py);
+        out.set_item("counts_final", counts_final)?;
+        out.set_item("delta", delta)?;
+        Ok(out.unbind())
+    }
+}
+
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(run_report, m)?)?;
     m.add_class::<rust_process::RustGrowCore>()?;
+    #[cfg(feature = "glpk")]
+    {
+        m.add_function(wrap_pyfunction!(fba_py::fba_solve, m)?)?;
+        m.add_function(wrap_pyfunction!(fba_py::flux_to_bulk_delta, m)?)?;
+    }
     Ok(())
 }

@@ -148,7 +148,11 @@ pub fn storenode_to_py<'py>(
         StoreNode::Bulk(b) => {
             if structured {
                 // M2 zero-copy: a read-only view over `BulkStore.count`.
-                bulk_count_view(py, &b.count)?
+                let view = bulk_count_view(py, &b.count)?;
+                let ids = bulk_ids(py, path, &b.ids, dtypes)?;
+                py.import("viva_core._bulkview")?
+                    .getattr("wrap")?
+                    .call1((view, ids))?
             } else {
                 let d = PyDict::new(py);
                 d.set_item("id", &b.ids)?;
@@ -179,6 +183,28 @@ pub fn storenode_to_py<'py>(
             }
         }
     })
+}
+
+/// numpy `id` array for a bulk store. Built ONCE per store at engine build
+/// (`DtypeMap::ids`, ids are immutable for a run); per tick this is an O(1)
+/// refcount clone. Falls back to building (uncached) if the path has no handle.
+fn bulk_ids<'py>(
+    py: Python<'py>,
+    path: &[String],
+    ids: &[String],
+    dtypes: &DtypeMap,
+) -> PyResult<Bound<'py, PyAny>> {
+    if let Some(h) = dtypes.ids.get(path) {
+        return Ok(h.bind(py).clone());
+    }
+    build_bulk_ids(py, ids)
+}
+
+/// Build the numpy unicode `id` array for a bulk store's ids.
+pub fn build_bulk_ids<'py>(py: Python<'py>, ids: &[String]) -> PyResult<Bound<'py, PyAny>> {
+    py.import("viva_core._bulkview")?
+        .getattr("make_ids")?
+        .call1((PyList::new(py, ids)?,))
 }
 
 /// Cached numpy dtype `[("count", "<i8")]` (built once, not per tick).
