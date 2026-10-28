@@ -201,8 +201,17 @@ impl Registry {
             Type::Map { .. } => (A::Map, R::MapMerge),
             Type::Tree { .. } => (A::Tree, R::TreeMerge),
             Type::List { .. } => (A::List, R::ListMerge),
-            Type::Node | Type::Quantity { .. } | Type::Record(_) | Type::Named(_) => {
+            Type::Node | Type::Quantity { .. } | Type::Record(_) => {
+                // Quantity has no custom apply in bigraph-schema 1.6.0: it
+                // inherits `apply(Node)`, whose scalar branch is `result =
+                // update` (replace). So a quantity leaf update replaces.
                 (A::NodeDefault, R::NodeDefault)
+            }
+            // An unresolved name must never silently fall through to a default
+            // overload — resolve it (`Registry::resolve`) first. Dispatching one
+            // is a programming error, surfaced loudly rather than mis-applied.
+            Type::Named(n) => {
+                panic!("dispatch on unresolved type {n:?}; call Registry::resolve first")
             }
         };
         Dispatch { apply, reconcile }
