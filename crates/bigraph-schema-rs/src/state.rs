@@ -745,9 +745,19 @@ pub fn decode_structured(m: &Map<Value>) -> Option<StoreNode> {
                 cols.insert(k.clone(), typed_column(a, col_kind(k)));
             }
         }
-        let metadata = match cols.get("unique_index") {
-            Some(Column::Int(a)) => a.iter().copied().max().map_or(0, |mx| mx as i128 + 1),
-            _ => 0,
+        // Prefer the explicit `metadata` (pb `MetadataArray.metadata`, the
+        // namespaced next-unique-index counter) carried in the tag; it is
+        // molecule-type-namespaced and so is NOT `max+1` for an empty store (e.g.
+        // `chromosomal_segment` ships empty with a large base). Fall back to
+        // `max(unique_index)+1` only when the tag omits it (e.g. a synthetic store
+        // built without a MetadataArray in the M1-M4 fixtures).
+        let metadata = match m.get("metadata") {
+            Some(Value::Int(x)) => *x as i128,
+            Some(Value::UInt(x)) => *x as i128,
+            _ => match cols.get("unique_index") {
+                Some(Column::Int(a)) => a.iter().copied().max().map_or(0, |mx| mx as i128 + 1),
+                _ => 0,
+            },
         };
         return Some(StoreNode::Unique(UniqueStore::from_columns_with_layout(
             layout, cols, metadata,

@@ -132,7 +132,7 @@ fn apply_one(node: &mut StoreNode, op: &Op, path: &[String]) -> Result<(), Apply
         }
         Op::SetStr(s) => replace_leaf(node, Value::Str(s.clone()), path)?,
         Op::SetBool(b) => replace_leaf(node, Value::Bool(*b), path)?,
-        Op::Overwrite(val) => replace_leaf(node, val.clone(), path)?,
+        Op::Overwrite(val) => replace_node(node, val, path)?,
         Op::Unique(u) => {
             let StoreNode::Unique(store) = node else {
                 return Err(ApplyError::TypeMismatch(path.to_vec()));
@@ -152,6 +152,41 @@ fn replace_leaf(node: &mut StoreNode, val: Value, path: &[String]) -> Result<(),
     };
     *v = val;
     Ok(())
+}
+
+/// `apply(Overwrite)` for any non-columnar node: a `Leaf` takes the new value; a
+/// `Branch` is REPLACED wholesale (pb `overwrite[map[...]]` — e.g. a Requester
+/// rewriting `request.<process>` each tick — swaps the whole subtree, so stale
+/// keys are dropped, not merged). A `Value::Map` rebuilds a `Branch` so later
+/// per-key reads/writes still resolve; other values become a `Leaf`. Bulk/Unique
+/// stores are never plain-overwritten (they take their own op kinds).
+fn replace_node(node: &mut StoreNode, val: &Value, path: &[String]) -> Result<(), ApplyError> {
+    match node {
+        StoreNode::Leaf(v) => {
+            *v = val.clone();
+            Ok(())
+        }
+        StoreNode::Branch(_) => {
+            *node = node_from_value(val);
+            Ok(())
+        }
+        _ => Err(ApplyError::TypeMismatch(path.to_vec())),
+    }
+}
+
+/// Build a [`StoreNode`] tree from a decoded [`Value`]: a `Map` becomes a
+/// `Branch` (recursively), anything else a `Leaf`.
+fn node_from_value(val: &Value) -> StoreNode {
+    match val {
+        Value::Map(m) => {
+            let mut b = crate::doc::Map::new();
+            for (k, v) in m {
+                b.insert(k.clone(), node_from_value(v));
+            }
+            StoreNode::Branch(b)
+        }
+        other => StoreNode::Leaf(other.clone()),
+    }
 }
 
 // ---- unique updater -------------------------------------------------------
@@ -208,8 +243,16 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
         let free = store.get_free_indices(n_new);
         let itemsize = store.layout.itemsize;
 
+        // Advance the next-unique-index counter by the number added, in BOTH the
+        // auto-assign and the pre-assigned (`unique_index` supplied) cases. pb
+        // bumps the counter by `n_new` either way: the updater does
+        // `result.metadata += n_new` when it auto-numbers, and
+        // `create_unique_indices` does `metadata += n` on the SAME store array
+        // when a process pre-numbers (then supplies `unique_index`). The view's
+        // `.metadata` is a fresh attribute here, so its pre-number bump does not
+        // flow back — advancing the store counter on apply reproduces pb's state.
+        let base = store.metadata;
         if !add.contains_key("unique_index") {
-            let base = store.metadata;
             if let Some(fl) = store.layout.field("unique_index").cloned() {
                 let buf = Arc::make_mut(&mut store.buf);
                 for (k, &row) in free.iter().enumerate() {
@@ -220,8 +263,8 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
                     write_cell(buf, itemsize, row, &fl, &Value::Int(x));
                 }
             }
-            store.metadata = base + n_new as i128;
         }
+        store.metadata = base + n_new as i128;
 
         {
             let layout = &store.layout;

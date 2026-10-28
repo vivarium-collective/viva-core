@@ -133,31 +133,61 @@ def _strip_layer_ports(wires):
     return wires
 
 
-def _serialize(value):
+def _serialize(value, numpy_tag=True):
     """A store value -> the tagged JSON the Rust codec decodes.
 
     numpy structured arrays (bulk: ``id``+``count``; unique: ``_entryState``+
     ``unique_index``) become ``__structured_array__`` dicts; plain arrays/scalars
     lower via ``tolist``/``item``; dicts/lists recurse.
+
+    ``numpy_tag`` controls how a plain (non-structured) ndarray leaf lowers: as a
+    ``__numpy__`` tag (the default, for STATE leaves — so they round-trip as real
+    ndarrays through the view and compare equal to pb) or as a bare list
+    (``numpy_tag=False``, for a native twin's CONFIG, whose constructor reads
+    ``protein_ids`` etc. as plain lists, not tagged dicts).
     """
     if isinstance(value, pint.Quantity):  # must precede the `tolist` branch
         return _serialize_quantity(value)
     names = getattr(getattr(value, "dtype", None), "names", None)
     if names:  # structured array (ndarray or v2ecoli MetadataArray)
-        return {
+        out = {
             "__structured_array__": True,
             "dtype": [[n, str(value.dtype[n])] for n in names],
             "columns": {n: value[n].tolist() for n in names},
             "length": int(len(value)),
         }
+        # Preserve the v2ecoli ``MetadataArray.metadata`` next-unique-index counter
+        # verbatim: it is molecule-type-namespaced (high-bit prefix), so it is NOT
+        # ``max(unique_index)+1`` for an empty unique store (e.g.
+        # ``chromosomal_segment`` ships empty with a large base). Without it the
+        # Rust side would hand out colliding indices for that molecule type.
+        md = getattr(value, "metadata", None)
+        if md is not None:
+            out["metadata"] = int(md)
+        return out
     if isinstance(value, np.generic):
         return value.item()
-    if hasattr(value, "tolist"):  # plain ndarray
+    if isinstance(value, np.ndarray) and value.ndim == 0:
+        # A 0-d array is a scalar leaf; pb serves it (and its schema coerces it)
+        # as a plain scalar, not an ndarray — keep it a scalar so numba kernels
+        # that do `min(x, scalar)` typecheck as they do under pb.
+        return value.item()
+    if isinstance(value, np.ndarray):  # plain (non-structured) ndarray, ndim >= 1
+        if numpy_tag:
+            # Preserve it as a ``__numpy__`` tag (dtype + shape + data) so the Rust
+            # codec decodes an ndarray leaf that the view rebuilds as a real
+            # ndarray, not a Python list — a reader doing array math / fancy-
+            # indexing (e.g. ``basal_prob[TU_index]``) then behaves as under pb,
+            # and the final state compares equal to pb's ndarray. (known-unknown a)
+            return {"__numpy__": True, "dtype": str(value.dtype),
+                    "shape": list(value.shape), "data": value.tolist()}
+        return value.tolist()
+    if hasattr(value, "tolist"):  # other array-likes
         return value.tolist()
     if isinstance(value, dict):
-        return {k: _serialize(v) for k, v in value.items()}
+        return {k: _serialize(v, numpy_tag) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_serialize(v) for v in value]
+        return [_serialize(v, numpy_tag) for v in value]
     return value
 
 
@@ -178,7 +208,9 @@ def _native_config_from_instance(edge):
     params = getattr(inst, "parameters", None)
     if not isinstance(params, dict):
         return {}
-    return {k: _serialize(v) for k, v in params.items()}
+    # Native-twin config: plain lists for ndarray params (the twin's constructor
+    # reads e.g. ``protein_ids`` as a list), NOT the ``__numpy__`` state tag.
+    return {k: _serialize(v, numpy_tag=False) for k, v in params.items()}
 
 
 def build_payload(state, native_addresses=None, path=()):
@@ -227,7 +259,17 @@ def build_payload(state, native_addresses=None, path=()):
                     f"edge {name!r} ({address}) has no realized 'instance' to hand "
                     "over; realize the composite (process_bigraph.Composite) first"
                 )
-            processes[name] = edge["instance"]
+            inst = edge["instance"]
+            # pb sets the edge name on each realized instance; some processes read
+            # it (v2ecoli `Requester.update_condition` logs `self.name`). The
+            # pre-built instances carry it for EcoliProcesses but not for the
+            # partition Requester/Evolver, so set it to the edge name to match pb.
+            try:
+                if getattr(inst, "name", None) != name:
+                    inst.name = name
+            except (AttributeError, TypeError):
+                pass
+            processes[name] = inst
             # Native-twin config is sourced from the live instance (empty on the
             # baseline edge) so the swap can build correct sim_data-derived params.
             # The instance is still handed over, so if the native path is disabled

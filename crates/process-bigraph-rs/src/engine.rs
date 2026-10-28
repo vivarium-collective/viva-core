@@ -229,17 +229,34 @@ impl Engine {
         Ok(())
     }
 
-    fn map_updates(slot: &Slot, ups: Vec<PortUpdate>) -> Result<Vec<Update>, EngineError> {
-        ups.into_iter()
-            .map(|u| {
-                wire_path(&slot.outputs, &slot.base, &u.port)
-                    .map(|path| Update { path, op: u.op })
-                    .ok_or_else(|| EngineError::UnwiredPort {
-                        path: slot.path.clone(),
-                        port: u.port.clone(),
-                    })
-            })
-            .collect()
+    fn map_updates(
+        state: &State,
+        slot: &Slot,
+        ups: Vec<PortUpdate>,
+    ) -> Result<Vec<Update>, EngineError> {
+        let mut out = Vec::with_capacity(ups.len());
+        for u in ups {
+            let path = wire_path(&slot.outputs, &slot.base, &u.port).ok_or_else(|| {
+                EngineError::UnwiredPort {
+                    path: slot.path.clone(),
+                    port: u.port.clone(),
+                }
+            })?;
+            // pb projects every update through the composition schema: a write
+            // whose target path is NOT in the schema is silently dropped (e.g.
+            // `ecoli-equilibrium` returns `listeners.equilibrium_listener.*`,
+            // which is not a field of the `listeners` store, so pb ignores it).
+            // The decoded state carries exactly the schema's leaves (dynamic
+            // `map`/`tree` keys such as `environment.exchange.*` are pre-seeded in
+            // the initial state), so "path exists in state" is the faithful proxy:
+            // keep writes to existing paths, drop writes to absent ones. This
+            // matches pb's drop AND avoids a spurious PathNotFound in apply.
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            if state.get(&refs).is_some() {
+                out.push(Update { path, op: u.op });
+            }
+        }
+        Ok(out)
     }
 
     fn calc_interval(state: &State, slot: &mut Slot, configured: f64) -> Result<f64, EngineError> {
@@ -258,7 +275,7 @@ impl Engine {
             base: &slot.base,
         };
         let ups = slot.process.update(&view, dt)?;
-        Self::map_updates(slot, ups)
+        Self::map_updates(state, slot, ups)
     }
 
     fn apply_all(&mut self, updates: Vec<Update>) -> Result<(), EngineError> {

@@ -50,7 +50,12 @@ def test_realized_composite_builds_whole_agent_payload(built):
     )
     assert "shape_step" in processes and processes["shape_step"] is not None
     topo = json.loads(topo_json)
-    assert topo["shape_step"]["address"] == "local:ShapeStep"  # dict address normalized
+    # dict address normalized to the ``protocol:data`` string. On v2ecoli @main
+    # (@20c69d78) ShapeStep registers under its fully-qualified ``!``-prefixed
+    # address; the point of the check is that the realized ``{'protocol','data'}``
+    # dict is flattened to a string (not that the data is the bare class name).
+    addr = topo["shape_step"]["address"]
+    assert isinstance(addr, str) and addr.startswith("local:") and addr.endswith("ShapeStep")
     # Task 1 (pint) + Task 2 (live stores) compose with the realized handoff.
     assert '"__pint__"' in state_json
     assert "allocator_rng" in handles and any(p.startswith("process/") for p in handles)
