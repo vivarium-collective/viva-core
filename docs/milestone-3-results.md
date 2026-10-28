@@ -96,6 +96,12 @@ dispatch/FFI win only, on the solve alone.
   matters once a full drop-in lands (keep problem and basis in Rust).
 - Tick-count semantics of Rust `run()` vs pb `until` were checked by exact
   equality, not independently.
+- **"Bit-for-bit" is scoped to same-libm hosts.** The RNG's poisson PTRS path
+  calls `ln`/`exp`/`sqrt`; bit-exactness vs numpy assumes Rust's libm resolves
+  identically to numpy's build (holds on the macOS dev machines verified here).
+  A different-libm host (e.g. a Linux/manylinux cluster build) could in principle
+  flip a rejection-boundary draw and diverge; this must be re-verified at the
+  manylinux/cluster milestone.
 - The whole-model number needs the full `partitioned.pbg` plus the remaining
   ports, and has not been measured.
 
