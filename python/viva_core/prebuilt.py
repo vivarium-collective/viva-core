@@ -78,15 +78,38 @@ def _serialize(value):
     return value
 
 
-def build_payload(state):
+def _native_config_from_instance(edge):
+    """Serialize a pre-built instance's ``.parameters`` into the JSON config its
+    NATIVE twin's constructor reads.
+
+    The baseline's edges carry an *empty* JSON ``config`` (the sim_data-derived
+    params are baked into the live instance, not serialized). The native twins
+    (M3) are, by contrast, built from the serialized config dict. So to swap a
+    native twin for a pre-built instance the config must be reconstructed from
+    the live instance — this closes the M4 "native-swap empty-config sourcing"
+    gap for ported processes (e.g. ProteinDegradation), whose ``.parameters`` is
+    exactly the serializable config dict. Only called for allow-listed native
+    addresses, so no unserializable handles are reached.
+    """
+    inst = edge.get("instance")
+    params = getattr(inst, "parameters", None)
+    if not isinstance(params, dict):
+        return {}
+    return {k: _serialize(v) for k, v in params.items()}
+
+
+def build_payload(state, native_addresses=None):
     """Split a realized composite state into the ``run_prebuilt`` arguments.
 
     Returns ``(processes, topology_json, state_json)``:
       * ``processes``: ``{edge_name: instance}`` for every non-emitter edge;
       * ``topology_json``: JSON spec of the edges (wiring only, configs dropped —
-        emitter edges keep their ``config`` since they are built natively);
+        emitter edges keep their ``config`` since they are built natively; an
+        allow-listed ``native_addresses`` edge keeps a config sourced from its
+        live instance so its native twin can be constructed);
       * ``state_json``: JSON spec of the data stores (tagged structured arrays).
     """
+    native = set(native_addresses or ())
     edges = {k: v for k, v in state.items() if _is_edge(v)}
     stores = {k: v for k, v in state.items() if not _is_edge(v)}
 
@@ -111,6 +134,12 @@ def build_payload(state):
                     "over; realize the composite (process_bigraph.Composite) first"
                 )
             processes[name] = edge["instance"]
+            # Native-twin config is sourced from the live instance (empty on the
+            # baseline edge) so the swap can build correct sim_data-derived params.
+            # The instance is still handed over, so if the native path is disabled
+            # (VIVA_NATIVE_PROCESSES off) the engine falls back to it bit-identically.
+            if address in native:
+                node["config"] = _native_config_from_instance(edge)
         topology[name] = node
 
     return processes, json.dumps(topology), json.dumps({k: _serialize(v) for k, v in stores.items()})
@@ -121,10 +150,11 @@ def run_from_state(state, n_ticks, native_addresses=None):
 
     ``state`` is a realized composite state dict (edges carry ``instance``);
     ``n_ticks`` scheduler iterations; ``native_addresses`` optionally swaps those
-    addresses for their native twin (also gated by ``VIVA_NATIVE_PROCESSES``).
+    addresses for their native twin (also gated by ``VIVA_NATIVE_PROCESSES``) —
+    each such edge's native config is sourced from its live instance.
     Returns the decoded final state dict.
     """
-    processes, topology_json, state_json = build_payload(state)
+    processes, topology_json, state_json = build_payload(state, native_addresses)
     return viva_core.run_prebuilt(
         processes, topology_json, state_json, n_ticks, native_addresses
     )
