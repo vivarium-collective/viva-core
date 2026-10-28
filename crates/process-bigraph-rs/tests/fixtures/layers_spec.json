@@ -1,0 +1,28 @@
+{
+  "global_time": 0.0,
+  "a": {"x": 1.0},
+  "b": {"y": 2.0},
+  "c": {"z": 0.0},
+  "results": {},
+  "emitter": {"_type": "step", "address": "local:process_bigraph.emitter.RAMEmitter",
+    "inputs": {"global_time": ["global_time"], "z": ["c", "z"], "w": ["results", "w"]}, "outputs": {}},
+  "s_prop": {"_type": "step", "address": "local:test.Prop",
+    "inputs": {"global_time": ["global_time"]}, "outputs": {"x": ["a", "x"]}},
+  "s_free": {"_type": "step", "address": "local:test.Free",
+    "inputs": {"bulk": ["b"]}, "outputs": {"y": ["b", "y"]}},
+  "s_cons": {"_type": "step", "address": "local:test.Cons",
+    "inputs": {"x": ["a", "x"], "y": ["b", "y"]}, "outputs": {"z": ["c", "z"]}},
+  "s_silent": {"_type": "step", "address": "local:test.Silent", "_triggers": {"x": "float"},
+    "inputs": {"x": ["a", "x"], "late": ["c", "z"]}, "outputs": {"s": ["results", "s"]}},
+  "sub": {
+    "s_nested": {"_type": "step", "address": "local:test.Nested",
+      "inputs": {"v": ["..", "c", "z"]}, "outputs": {"w": ["..", "results", "w"]}}
+  },
+  "cyc_p": {"_type": "step", "address": "local:test.P", "priority": 2.0,
+    "inputs": {"i": ["cyc", "q"]}, "outputs": {"o": ["cyc", "p"]}},
+  "cyc_q": {"_type": "step", "address": "local:test.Q", "priority": 1.0,
+    "inputs": {"i": ["cyc", "p"]}, "outputs": {"o": ["cyc", "q"]}},
+  "cyc": {"p": 0.0, "q": 0.0},
+  "proc": {"_type": "process", "address": "local:test.Proc", "interval": 1.0,
+    "inputs": {"x": ["a", "x"]}, "outputs": {"x": ["a", "x"]}}
+}

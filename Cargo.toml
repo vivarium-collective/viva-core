@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/bigraph-schema-rs"]
+members = ["crates/bigraph-schema-rs", "crates/process-bigraph-rs"]
 
 [workspace.package]
 version = "0.1.0"

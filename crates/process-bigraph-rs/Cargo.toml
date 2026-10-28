@@ -1,0 +1,13 @@
+[package]
+name = "process-bigraph-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust scheduler, tick loop and emitters mirroring process-bigraph 1.8.3 execution order"
+
+[dependencies]
+bigraph-schema-rs = { path = "../bigraph-schema-rs" }
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"
