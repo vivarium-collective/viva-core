@@ -2,8 +2,6 @@
 //! numpy structured-array view building, and update-dict -> typed [`Op`]
 //! translation.
 
-use std::sync::Arc;
-
 use pyo3::prelude::*;
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
@@ -512,9 +510,3 @@ fn parse_delete(obj: &Bound<'_, PyAny>) -> PyResult<Vec<Vec<usize>>> {
         _ => Ok(Vec::new()),
     }
 }
-
-// Keep Arc in scope for callers constructing DtypeMaps.
-#[allow(unused_imports)]
-use std::marker::PhantomData as _Phantom;
-#[allow(dead_code)]
-fn _keep_arc(_: Arc<DtypeMap>) {}

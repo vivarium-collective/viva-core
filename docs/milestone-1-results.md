@@ -43,13 +43,14 @@ store end-to-end through a Python process, both shapes of `BulkNumpyUpdate`:
 * **vectorized** `(index_array, delta_array)` — v2ecoli's real evolver shape;
 * **scalar** `[(index, delta), …]` list.
 
-Both are bit-identical to pb. Two findings surfaced and were fixed (see §4);
+Both are bit-identical to pb. Precondition: the bulk apply is bit-identical for UNIQUE indices within a tuple; for DUPLICATE indices within a single `(idx_array, delta_array)`, Rust accumulates sequentially while numpy fancy-indexed `+=` is last-wins. This is out of the realistic path (v2ecoli evolvers use per-molecule unique indices) and is to be covered when a duplicate-index process is ported. Two findings surfaced and were fixed (see §4);
 neither is a residual bug.
 
 **Important modelling note (real finding, not hidden):** the bulk driver is a
 **Process**, not a Step. The Rust engine runs every Step **each cascade**, while
 pb triggers Steps **reactively on input change**. For idempotent derivers
-(v2ecoli's actual Steps) this is invisible; for a *non-idempotent* Step it
+(v2ecoli's actual Steps) this is invisible; the precise divergence condition is a later-layer Step that is BOTH
+restricted-trigger (no layer-0 ancestor) AND non-idempotent (additive); such a Step
 diverges on run-count. Bulk writes in v2ecoli come from Processes, which both
 engines schedule identically (`calculate_timestep`), so the realistic path is
 bit-identical. The Step/Process triggering difference is documented here as a
