@@ -38,6 +38,23 @@ pub trait Process {
     /// Compute this process' update from its wired view. `interval` is the
     /// process interval, or `-1.0` for steps (as pb invokes steps).
     fn update(&mut self, view: &PortView, interval: f64) -> Result<Vec<PortUpdate>, ProcessError>;
+    /// pb `process['instance'].calculate_timestep(interval, state)`: the
+    /// dynamic interval a process advances by, computed from its view each time
+    /// it is due. Default: the configured interval (the common case). Variable-
+    /// timestep processes (e.g. v2ecoli `GlobalClock`) override it.
+    fn calculate_timestep(
+        &mut self,
+        _view: &PortView,
+        configured: f64,
+    ) -> Result<f64, ProcessError> {
+        Ok(configured)
+    }
+    /// pb `run_steps` gate (`EcoliStep.perform_update` / `update_condition`): a
+    /// step is SKIPPED (contributes no update) when this returns `false`. The
+    /// engine calls it before `update`, so a gated process never computes.
+    fn perform_update(&mut self, _view: &PortView) -> Result<bool, ProcessError> {
+        Ok(true)
+    }
     /// Emitters expose their captured rows here.
     fn history(&self) -> Option<Vec<Row>> {
         None
@@ -101,6 +118,13 @@ impl<'a> PortView<'a> {
 
     pub fn port_names(&self) -> Vec<&'a str> {
         self.wires.keys().map(String::as_str).collect()
+    }
+
+    /// Absolute store path a port resolves to through the input wires (so a
+    /// caller can key per-store metadata, e.g. numpy dtypes, by path).
+    pub fn path(&self, port: &[&str]) -> Option<Vec<String>> {
+        let port: Vec<String> = port.iter().map(|s| s.to_string()).collect();
+        wire_path(self.wires, self.base, &port)
     }
 
     /// Clone the whole viewed tree (shape follows the wire tree), as

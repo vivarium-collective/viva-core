@@ -1,0 +1,18 @@
+[build-system]
+requires = ["maturin>=1.15,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "viva_core"
+requires-python = ">=3.10"
+description = "Rust process-bigraph engine (bigraph-schema + process-bigraph) as a PyO3 wheel; runs real v2ecoli .pbg models with Python processes, bit-identical to pb 1.8.3"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+]
+dynamic = ["version"]
+
+[tool.maturin]
+# The PyO3 cdylib lives in the workspace crate; build that one into the wheel.
+manifest-path = "crates/viva-core/Cargo.toml"
+module-name = "viva_core"

@@ -57,6 +57,16 @@ struct Slot {
     pending: Vec<Update>,
 }
 
+/// One record of a step's gate decision during a cascade: its path, the
+/// `global_time` the cascade ran at, and whether its `perform_update` gate
+/// passed (so it actually ran). Drives the Task-5 differential gating check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepRun {
+    pub path: Vec<String>,
+    pub global_time: f64,
+    pub ran: bool,
+}
+
 pub struct Engine {
     pub state: State,
     pub layers: Vec<Layer>,
@@ -64,6 +74,9 @@ pub struct Engine {
     steps: Vec<Slot>,
     step_index: HashMap<Vec<String>, usize>,
     started: bool,
+    /// Per-cascade gate log (every step, every cascade), for the differential
+    /// gating check (set of steps that actually ran per tick + per-step counts).
+    pub step_run_log: Vec<StepRun>,
 }
 
 fn wires(v: &Option<Value>) -> Map<Value> {
@@ -123,6 +136,7 @@ impl Engine {
             steps,
             step_index,
             started: false,
+            step_run_log: Vec::new(),
         };
         let t = engine.global_time()?;
         for p in &mut engine.processes {
@@ -194,6 +208,15 @@ impl Engine {
             .collect()
     }
 
+    fn calc_interval(state: &State, slot: &mut Slot, configured: f64) -> Result<f64, EngineError> {
+        let view = PortView {
+            state,
+            wires: &slot.inputs,
+            base: &slot.base,
+        };
+        Ok(slot.process.calculate_timestep(&view, configured)?)
+    }
+
     fn invoke(state: &State, slot: &mut Slot, dt: f64) -> Result<Vec<Update>, EngineError> {
         let view = PortView {
             state,
@@ -213,14 +236,33 @@ impl Engine {
         Ok(())
     }
 
-    /// pb `run_steps` over every layer in order.
+    /// pb `run_steps` over every layer in order. Each step is gated by
+    /// `perform_update` (pb's `EcoliStep.perform_update`/`update_condition`): a
+    /// gated step contributes NO update and is logged as not-run.
     fn run_step_layers(&mut self) -> Result<(), EngineError> {
+        let gt = self.global_time()?;
         for li in 0..self.layers.len() {
             let mut updates = Vec::new();
             for si in 0..self.layers[li].steps.len() {
                 let idx = self.step_index[&self.layers[li].steps[si].path];
-                // Steps are invoked with interval = -1.0.
-                updates.extend(Self::invoke(&self.state, &mut self.steps[idx], -1.0)?);
+                let ran = {
+                    let slot = &mut self.steps[idx];
+                    let view = PortView {
+                        state: &self.state,
+                        wires: &slot.inputs,
+                        base: &slot.base,
+                    };
+                    slot.process.perform_update(&view)?
+                };
+                self.step_run_log.push(StepRun {
+                    path: self.steps[idx].path.clone(),
+                    global_time: gt,
+                    ran,
+                });
+                if ran {
+                    // Steps are invoked with interval = -1.0.
+                    updates.extend(Self::invoke(&self.state, &mut self.steps[idx], -1.0)?);
+                }
             }
             self.apply_all(updates)?;
         }
@@ -233,28 +275,33 @@ impl Engine {
         let mut full_step = f64::INFINITY;
 
         for i in 0..self.processes.len() {
-            let slot = &mut self.processes[i];
-            if slot.front_time <= gt {
-                if slot.interval.is_nan() || slot.interval <= 0.0 {
+            let front_time = self.processes[i].front_time;
+            if front_time <= gt {
+                // pb run_process: process_interval =
+                //   instance.calculate_timestep(process['interval'], state);
+                //   process['interval'] = process_interval.
+                let configured = self.processes[i].interval;
+                let dt = Self::calc_interval(&self.state, &mut self.processes[i], configured)?;
+                self.processes[i].interval = dt;
+                if dt.is_nan() || dt <= 0.0 {
                     return Err(EngineError::BadInterval {
-                        path: slot.path.clone(),
-                        interval: slot.interval,
+                        path: self.processes[i].path.clone(),
+                        interval: dt,
                     });
                 }
-                let future = slot.front_time + slot.interval;
+                let future = front_time + dt;
                 let interval = future - gt;
                 if interval < full_step {
                     full_step = interval;
                 }
                 if future <= end_time {
-                    let dt = slot.interval;
                     let update = Self::invoke(&self.state, &mut self.processes[i], dt)?;
                     let slot = &mut self.processes[i];
                     slot.front_time = future;
                     slot.pending = update;
                 }
             } else {
-                let delay = slot.front_time - gt;
+                let delay = front_time - gt;
                 if delay < full_step {
                     full_step = delay;
                 }

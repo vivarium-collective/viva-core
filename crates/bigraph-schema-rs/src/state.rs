@@ -17,7 +17,7 @@
 //! Counts are Python unbounded ints upstream; see `apply` for the i128/checked
 //! arithmetic that keeps the i64 columns from silently wrapping.
 
-use crate::doc::{Map, Value};
+use crate::doc::{Map, TagKind, Value};
 use crate::types::Field;
 use ndarray::Array1;
 
@@ -279,7 +279,16 @@ fn conv_store(m: &Map<crate::doc::Node>) -> Map<StoreNode> {
                 );
             }
             Node::Leaf(v) => {
-                out.insert(k.clone(), StoreNode::Leaf(v.clone()));
+                // A real `.pbg` delivers bulk/unique stores as tagged
+                // structured arrays (numpy/pint `json_codec` forms), not plain
+                // columnar objects — decode those into Bulk/Unique here.
+                let node = match v {
+                    Value::Tagged(TagKind::StructuredArray | TagKind::NumpyStructured, m) => {
+                        decode_structured(m).unwrap_or_else(|| StoreNode::Leaf(v.clone()))
+                    }
+                    _ => StoreNode::Leaf(v.clone()),
+                };
+                out.insert(k.clone(), node);
             }
         }
     }
@@ -322,6 +331,115 @@ fn classify_store(s: &Map<crate::doc::Node>) -> Option<StoreNode> {
         return Some(StoreNode::Unique(UniqueStore::from_columns(columns, 0)));
     }
     None
+}
+
+/// Decode a `json_codec` tagged structured array (`__structured_array__` /
+/// `__numpy_structured__`: `{dtype:[[name,dtype],...], columns:{name:[...]},
+/// length:n}`) into a [`BulkStore`] (`id`+`count`) or a [`UniqueStore`]
+/// (`_entryState`+`unique_index`).
+///
+/// This is the real-`.pbg` initial-state owner (Task-5 requirement 1): the
+/// engine can only load a real model once bulk/unique binary structured arrays
+/// lift into the columnar [`State`] representation. Column kinds come from the
+/// numpy dtype string (`int*`/`uint*`/`bool`→Int/Bool, `float*`→Float, `<U`/
+/// `str`→Str, tuple sub-array dtypes like `('<i4', (2,))`→Nested).
+///
+/// For a unique store, the `metadata` (`unique_index`) counter is initialised
+/// to `max(unique_index) + 1` (Task-5 requirement 2): a real store already
+/// holds molecules, so the first `add` must number new rows past the existing
+/// maximum or it would collide `unique_index` (matches
+/// `UniqueNumpyUpdater`/`create_unique_indices` semantics).
+pub fn decode_structured(m: &Map<Value>) -> Option<StoreNode> {
+    let dtypes = structured_dtypes(m)?;
+    let columns = match m.get("columns") {
+        Some(Value::Map(c)) => c,
+        _ => return None,
+    };
+    let col_kind = |name: &str| -> Option<&str> {
+        dtypes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.as_str())
+    };
+
+    let has = |k: &str| columns.contains_key(k);
+    if has("id") && has("count") {
+        let ids = match columns.get("id") {
+            Some(Value::Array(a)) => a.iter().map(value_to_string).collect(),
+            _ => Vec::new(),
+        };
+        let count = match columns.get("count") {
+            Some(Value::Array(a)) => to_i64_array(a),
+            _ => Array1::from_vec(Vec::new()),
+        };
+        let mut floats = Map::new();
+        for (k, v) in columns {
+            if k == "id" || k == "count" {
+                continue;
+            }
+            if let Value::Array(a) = v {
+                floats.insert(k.clone(), to_f64_array(a));
+            }
+        }
+        return Some(StoreNode::Bulk(BulkStore { ids, count, floats }));
+    }
+    if has("_entryState") && has("unique_index") {
+        let mut cols = Map::new();
+        for (k, v) in columns {
+            if let Value::Array(a) = v {
+                cols.insert(k.clone(), typed_column(a, col_kind(k)));
+            }
+        }
+        let metadata = match cols.get("unique_index") {
+            Some(Column::Int(a)) => a.iter().copied().max().map_or(0, |mx| mx as i128 + 1),
+            _ => 0,
+        };
+        return Some(StoreNode::Unique(UniqueStore::from_columns(cols, metadata)));
+    }
+    None
+}
+
+/// Parse the `dtype` field (`[[name, dtype_str], ...]`) into `(name, dtype)` pairs.
+fn structured_dtypes(m: &Map<Value>) -> Option<Vec<(String, String)>> {
+    match m.get("dtype") {
+        Some(Value::Array(entries)) => Some(
+            entries
+                .iter()
+                .filter_map(|e| match e {
+                    Value::Array(pair) if pair.len() >= 2 => match (&pair[0], &pair[1]) {
+                        (Value::Str(n), Value::Str(d)) => Some((n.clone(), d.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// Choose a [`Column`] kind from a numpy dtype string, falling back to
+/// first-element inference when the dtype is unknown.
+fn typed_column(a: &[Value], dtype: Option<&str>) -> Column {
+    let Some(d) = dtype else {
+        return to_column(a);
+    };
+    // A tuple dtype (`('<i4', (2,))`) marks a per-row sub-array field.
+    if d.starts_with('(') {
+        return Column::Nested(a.to_vec());
+    }
+    let d = d.trim_start_matches(['<', '>', '=', '|']);
+    if d.starts_with("int") || d.starts_with("uint") || d.starts_with('i') || d.starts_with('u') {
+        Column::Int(to_i64_array(a))
+    } else if d.starts_with("float") || d.starts_with('f') {
+        Column::Float(to_f64_array(a))
+    } else if d.starts_with("bool") || d == "b1" || d.starts_with('?') {
+        Column::Bool(a.iter().map(|v| matches!(v, Value::Bool(true))).collect())
+    } else if d.starts_with('U') || d.starts_with('S') || d.starts_with("str") {
+        Column::Str(a.iter().map(value_to_string).collect())
+    } else {
+        to_column(a)
+    }
 }
 
 fn value_to_string(v: &Value) -> String {
