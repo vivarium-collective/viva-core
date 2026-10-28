@@ -25,7 +25,7 @@ use bigraph_schema_rs::codec;
 use bigraph_schema_rs::doc::{CompositeSpec, Map, Node, TagKind, Value};
 use bigraph_schema_rs::state::{from_initial, StoreNode};
 use process_bigraph_rs::engine::Engine;
-use process_bigraph_rs::process::Process;
+use process_bigraph_rs::process::{wire_path, Process};
 use process_bigraph_rs::registry::ProcessRegistry;
 
 mod convert;
@@ -205,6 +205,68 @@ fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
     Engine::with_state(spec, state, &registry).map_err(|e| perr(format!("building engine: {e}")))
 }
 
+/// Edge wire map (`inputs`/`outputs`) as a `Map<Value>`, or empty.
+fn edge_wires(w: &Option<Value>) -> Map<Value> {
+    match w {
+        Some(Value::Map(m)) => m.clone(),
+        _ => Map::new(),
+    }
+}
+
+/// Collect every leaf port path of a wire tree (the nested port-key sequences a
+/// write/read addresses).
+fn collect_leaf_ports(wires: &Map<Value>, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    for (k, v) in wires {
+        prefix.push(k.clone());
+        match v {
+            Value::Map(m) => collect_leaf_ports(m, prefix, out),
+            _ => out.push(prefix.clone()),
+        }
+        prefix.pop();
+    }
+}
+
+/// Fail loud if any edge writes a handle path through wiring that is not
+/// symmetric between inputs and outputs.
+///
+/// The update-boundary DROP ([`convert::translate_update`]) decides whether a
+/// write targets a handle path by resolving the output port through the INPUT
+/// wires ([`PortView::path`]), whereas the engine routes the actual write through
+/// the OUTPUT wires ([`Engine::map_updates`]). That is sound ONLY because a handle
+/// port (e.g. `process`, read AND written) wires identically on both sides. This
+/// checks the invariant at build time, so an asymmetric wiring — an output port
+/// landing on a handle path whose same-port input wiring is absent or different —
+/// fails here instead of silently misrouting (and corrupting) a handle write.
+fn check_handle_wire_symmetry(
+    spec: &CompositeSpec,
+    handles: &HashMap<Vec<String>, Py<PyAny>>,
+) -> PyResult<()> {
+    for (path, edge) in spec.edges() {
+        let base = &path[..path.len().saturating_sub(1)];
+        let inputs = edge_wires(&edge.inputs);
+        let outputs = edge_wires(&edge.outputs);
+        let mut ports = Vec::new();
+        collect_leaf_ports(&outputs, &mut Vec::new(), &mut ports);
+        for port in &ports {
+            let Some(abs) = wire_path(&outputs, base, port) else {
+                continue;
+            };
+            if !handles.contains_key(&abs) {
+                continue;
+            }
+            let in_abs = wire_path(&inputs, base, port);
+            if in_abs.as_ref() != Some(&abs) {
+                return Err(perr(format!(
+                    "handle port {port:?} on edge {path:?} writes the handle path {abs:?}, \
+                     but its INPUT wiring resolves to {in_abs:?}; the update-boundary drop \
+                     keys off input wires and would miss this write (asymmetric handle wiring)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_emitter(address: &str) -> bool {
     address.contains("Emitter")
         || address.ends_with("ram-emitter")
@@ -312,6 +374,11 @@ fn build_prebuilt_engine(
                 .collect();
             dtype_map.handles.insert(path, obj.unbind());
         }
+    }
+    // Guard the drop's input-vs-output wire-symmetry assumption (see the function
+    // docs); a no-op when there are no handles.
+    if !dtype_map.handles.is_empty() {
+        check_handle_wire_symmetry(&combined, &dtype_map.handles)?;
     }
     let dtypes = Arc::new(dtype_map);
 

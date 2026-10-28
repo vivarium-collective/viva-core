@@ -641,6 +641,16 @@ class QuantityCycler(EcoliProcess):
 # draws (the stream). Cleared by the test before each run.
 HANDLE_LOG: list = []
 
+# Records every attempt to LOWER the live `process` handle across the boundary
+# (``convert.rs::py_to_value``'s numpy fallback calls ``.tolist()``). The handle
+# DROP at the update boundary means a handle-path write is never lowered, so this
+# stays empty; if the drop were removed, the engine would call ``py_to_value`` on
+# the ``(instance,)`` tuple each tick and this would fire. Observing it is the
+# only signal BELOW the re-insertion mask (the view boundary and ``state_to_py``
+# both re-insert the live handle, hiding any corrupted stored leaf), so this is
+# what makes the drop test non-vacuous. Cleared by the test before each run.
+HANDLE_SERIALIZE_LOG: list = []
+
 
 class PartitionedHandle:
     """The live object carried by the `process` store as `(instance,)` — the
@@ -657,6 +667,15 @@ class PartitionedHandle:
         self.counter += 1
         self.request_set = True
         return self.counter
+
+    def tolist(self):
+        """Serialization probe (NOT part of the partition contract). ``py_to_value``
+        tries ``.tolist()`` when lowering an unknown object; a correct handle drop
+        means this live object is never lowered, so this must never be called. If
+        it is, the update boundary serialized a handle-path write — the bug the
+        drop prevents."""
+        HANDLE_SERIALIZE_LOG.append(id(self))
+        return []
 
 
 class HandleRequester(EcoliStep):

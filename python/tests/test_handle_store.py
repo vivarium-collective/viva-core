@@ -152,14 +152,17 @@ def results():
     # Candidate: the Python->Rust handoff on a second, identical build. Fresh
     # objects (same seed) so pb's run above did not advance them.
     cp.HANDLE_LOG.clear()
+    cp.HANDLE_SERIALIZE_LOG.clear()
     got_slice, got_obj, got_rng = _build_slice(SEED)
     got_state = prebuilt.run_from_state(got_slice, n_ticks=N_TICKS)
     got_log = list(cp.HANDLE_LOG)
+    got_serialize_log = list(cp.HANDLE_SERIALIZE_LOG)
     got_obs = _observable(got_state)
 
     return {
         "ref_log": ref_log, "ref_obs": ref_obs,
         "got_log": got_log, "got_obs": got_obs,
+        "got_serialize_log": got_serialize_log,
         "got_state": got_state,
         "got_obj": got_obj, "got_rng": got_rng,
         "got_slice": got_slice,
@@ -223,6 +226,20 @@ def test_handle_write_is_noop(results):
     # The shared counter the Evolver read equals what the Requester set that tick.
     assert _counters(results["got_log"], "evolver") == \
         _counters(results["got_log"], "requester")
+
+
+def test_handle_write_drop_is_non_vacuous(results):
+    """The drop is observed BELOW the re-insertion mask: the live `process` handle
+    is written back every cascade (`{"process": (obj,)}`), but the update-boundary
+    DROP means it is never lowered through `py_to_value`. The handle object's
+    `tolist` probe therefore never fires. Removing the drop makes the engine
+    serialize the `(instance,)` tuple each tick → the probe fires → this FAILS.
+    (The identity/no-op assertions above cannot catch that regression on their own
+    because every read re-inserts the live handle, masking the corrupted leaf.)"""
+    assert results["got_serialize_log"] == [], (
+        "the live process handle was serialized across the boundary — the "
+        "handle-path write was NOT dropped"
+    )
 
 
 # (d) RNG stream unchanged: allocator draws match pb exactly ---------------------
