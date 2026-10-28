@@ -289,6 +289,12 @@ pub fn storenode_to_py<'py>(
     dtypes: &DtypeMap,
     structured: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // M5 Task 2: a live-object store path returns its Python-owned handle VERBATIM
+    // (the `(instance,)` tuple so `proc_state[0]` works; the `RandomState` itself),
+    // never a decoded `Value`. The state node here is only a placeholder.
+    if let Some(h) = dtypes.handles.get(path) {
+        return Ok(h.bind(py).clone());
+    }
     Ok(match node {
         StoreNode::Leaf(v) => value_to_py(py, v)?,
         StoreNode::Branch(m) => {
@@ -623,14 +629,20 @@ pub fn build_view<'py>(
 }
 
 /// Convert the whole final [`State`] to a Python dict (plain columns; the parity
-/// test compares this against the pb `Composite.state`).
-pub fn state_to_py<'py>(py: Python<'py>, state: &State) -> PyResult<Bound<'py, PyDict>> {
-    let empty = DtypeMap::new();
+/// test compares this against the pb `Composite.state`). `dtypes` carries the
+/// live-object handle table so handle paths return the same Python objects pb
+/// holds (e.g. the `(instance,)` process store, `allocator_rng`); it has no
+/// handles on the JSON `run` path.
+pub fn state_to_py<'py>(
+    py: Python<'py>,
+    state: &State,
+    dtypes: &DtypeMap,
+) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let mut path = Vec::new();
     for (k, n) in &state.root {
         path.push(k.clone());
-        d.set_item(k, storenode_to_py(py, n, &path, &empty, false)?)?;
+        d.set_item(k, storenode_to_py(py, n, &path, dtypes, false)?)?;
         path.pop();
     }
     Ok(d)
@@ -674,14 +686,31 @@ fn parse_leaf_type(s: &str) -> Type {
 
 /// Walk a returned update value against the output schema, appending typed
 /// [`PortUpdate`]s. `port_path` accumulates the (sub-)port keys.
+///
+/// `view`/`dtypes` implement the M5 Task 2 handle drop: a write whose port
+/// resolves (through the input wires, which carry the handle port too — the
+/// `process` port is read AND written) to a live-object store path is DROPPED.
+/// The handle is the same shared object, already mutated in place, so the value
+/// write is a no-op; the Requester→Evolver ordering edge is static wiring and is
+/// unaffected (only the runtime value is skipped, never the wire).
 pub fn translate_update(
     update: &Bound<'_, PyAny>,
     schema: &OutSchema,
     port_path: &mut Vec<String>,
     out: &mut Vec<PortUpdate>,
+    view: &PortView<'_>,
+    dtypes: &DtypeMap,
 ) -> PyResult<()> {
     match schema {
         OutSchema::Leaf(ty) => {
+            if !dtypes.handles.is_empty() {
+                let refs: Vec<&str> = port_path.iter().map(String::as_str).collect();
+                if let Some(abs) = view.path(&refs) {
+                    if dtypes.handles.contains_key(&abs) {
+                        return Ok(()); // drop: no-op write to a handle path
+                    }
+                }
+            }
             let op = op_from_type(ty, update)?;
             if let Some(op) = op {
                 out.push(PortUpdate {
@@ -697,7 +726,7 @@ pub fn translate_update(
             for (key, sub) in entries {
                 if let Some(v) = dict.get_item(key)? {
                     port_path.push(key.clone());
-                    translate_update(&v, sub, port_path, out)?;
+                    translate_update(&v, sub, port_path, out, view, dtypes)?;
                     port_path.pop();
                 }
             }

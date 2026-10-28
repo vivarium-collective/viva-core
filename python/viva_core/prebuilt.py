@@ -52,6 +52,44 @@ def _serialize_quantity(q):
     return {"__pint__": True, "magnitude": mag, "units": units}
 
 
+_JSON_LEAF = (int, float, bool, str, bytes, type(None), list, dict)
+
+
+def _is_live_element(x):
+    """True for an object the JSON state channel cannot carry — not a JSON
+    primitive/container, not a numpy array/scalar."""
+    return not isinstance(x, _JSON_LEAF + (np.ndarray, np.generic))
+
+
+def _is_handle(value):
+    """A store value that is a LIVE Python object passed by reference, not
+    serialized (Option 1): a numpy ``RandomState``/``Generator``
+    (``allocator_rng``), or a tuple holding a live instance (the ``(instance,)``
+    ``process`` store)."""
+    if isinstance(value, (np.random.RandomState, np.random.Generator)):
+        return True
+    if isinstance(value, tuple):
+        return any(_is_live_element(x) for x in value)
+    return False
+
+
+def _split_stores(stores, handles):
+    """Serialize the data stores to the tagged JSON the Rust codec decodes,
+    routing every live-object leaf into ``handles`` (keyed by its ``/``-joined
+    absolute store path) and leaving a ``null`` placeholder in the JSON at that
+    path — so the store still exists, the wiring + the Requester→Allocator→Evolver
+    step ordering are unchanged, and ``_serialize`` never meets a live object."""
+    def walk(value, path):
+        if _is_handle(value):
+            handles["/".join(path)] = value
+            return None  # placeholder: the handle travels out-of-band
+        if isinstance(value, dict):
+            return {k: walk(v, path + [k]) for k, v in value.items()}
+        return _serialize(value)
+
+    return {k: walk(v, [k]) for k, v in stores.items()}
+
+
 def _is_edge(v):
     return isinstance(v, dict) and "address" in v and ("inputs" in v or "outputs" in v)
 
@@ -127,13 +165,18 @@ def _native_config_from_instance(edge):
 def build_payload(state, native_addresses=None):
     """Split a realized composite state into the ``run_prebuilt`` arguments.
 
-    Returns ``(processes, topology_json, state_json)``:
+    Returns ``(processes, topology_json, state_json, handles)``:
       * ``processes``: ``{edge_name: instance}`` for every non-emitter edge;
       * ``topology_json``: JSON spec of the edges (wiring only, configs dropped —
         emitter edges keep their ``config`` since they are built natively; an
         allow-listed ``native_addresses`` edge keeps a config sourced from its
         live instance so its native twin can be constructed);
-      * ``state_json``: JSON spec of the data stores (tagged structured arrays).
+      * ``state_json``: JSON spec of the data stores (tagged structured arrays;
+        live-object stores carry a ``null`` placeholder);
+      * ``handles``: ``{path: live_object}`` (path ``/``-joined) for the live
+        process-as-data store (``["process", <name>]`` → the ``(instance,)``
+        tuple) and ``["allocator_rng"]`` (the ``RandomState``) — passed by
+        reference so the Rust engine never serializes them (Option 1).
     """
     native = set(native_addresses or ())
     edges = {k: v for k, v in state.items() if _is_edge(v)}
@@ -168,7 +211,9 @@ def build_payload(state, native_addresses=None):
                 node["config"] = _native_config_from_instance(edge)
         topology[name] = node
 
-    return processes, json.dumps(topology), json.dumps({k: _serialize(v) for k, v in stores.items()})
+    handles = {}
+    state_json = json.dumps(_split_stores(stores, handles))
+    return processes, json.dumps(topology), state_json, handles
 
 
 def run_from_state(state, n_ticks, native_addresses=None):
@@ -180,7 +225,7 @@ def run_from_state(state, n_ticks, native_addresses=None):
     each such edge's native config is sourced from its live instance.
     Returns the decoded final state dict.
     """
-    processes, topology_json, state_json = build_payload(state, native_addresses)
+    processes, topology_json, state_json, handles = build_payload(state, native_addresses)
     return viva_core.run_prebuilt(
-        processes, topology_json, state_json, n_ticks, native_addresses
+        processes, topology_json, state_json, n_ticks, native_addresses, handles
     )

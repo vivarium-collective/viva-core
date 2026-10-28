@@ -115,8 +115,15 @@ impl Process for PyProcess {
                 .map_err(|e| proc_err(format!("{}.update: {e}", self.name)))?;
             let mut out = Vec::new();
             let mut port_path = Vec::new();
-            translate_update(&result, &self.out_schema, &mut port_path, &mut out)
-                .map_err(proc_err)?;
+            translate_update(
+                &result,
+                &self.out_schema,
+                &mut port_path,
+                &mut out,
+                view,
+                &self.dtypes,
+            )
+            .map_err(proc_err)?;
             Ok(out)
         })
     }

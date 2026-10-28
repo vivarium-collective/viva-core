@@ -143,8 +143,8 @@ def _hand_pd_per_tick(native, n1=100, n2=600):
         if native:
             os.environ["VIVA_NATIVE_PROCESSES"] = "ProteinDegradation"
         try:
-            procs, tj, sj = prebuilt.build_payload(doc, nat)
-            t = time.time(); viva_core.run_prebuilt(procs, tj, sj, n, nat); return time.time() - t
+            procs, tj, sj, handles = prebuilt.build_payload(doc, nat)
+            t = time.time(); viva_core.run_prebuilt(procs, tj, sj, n, nat, handles); return time.time() - t
         finally:
             os.environ.pop("VIVA_NATIVE_PROCESSES", None)
     run_to(n2)
