@@ -6,7 +6,7 @@ license.workspace = true
 description = "PyO3 wheel: the Rust process-bigraph engine running real v2ecoli .pbg models with Python processes (quadrant 3)"
 
 [lib]
-name = "viva_core"
+name = "_native"
 crate-type = ["cdylib", "rlib"]
 # The PyO3 extension-module can't link a standalone test harness (no libpython);
 # it is exercised through `python/tests` under `.venv-m1`, not `cargo test`.

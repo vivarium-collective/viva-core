@@ -15,4 +15,5 @@ dynamic = ["version"]
 [tool.maturin]
 # The PyO3 cdylib lives in the workspace crate; build that one into the wheel.
 manifest-path = "crates/viva-core/Cargo.toml"
-module-name = "viva_core"
+python-source = "python"
+module-name = "viva_core._native"

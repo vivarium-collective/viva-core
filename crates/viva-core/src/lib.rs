@@ -30,6 +30,7 @@ use process_bigraph_rs::registry::ProcessRegistry;
 
 mod convert;
 mod pyproc;
+mod rust_process;
 
 use pyproc::PyProcess;
 
@@ -182,8 +183,9 @@ fn run_report(py: Python<'_>, spec: &str, n_ticks: usize) -> PyResult<Py<PyDict>
 }
 
 #[pymodule]
-fn viva_core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(run_report, m)?)?;
+    m.add_class::<rust_process::RustGrowCore>()?;
     Ok(())
 }
