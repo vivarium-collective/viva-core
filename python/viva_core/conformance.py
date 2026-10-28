@@ -234,7 +234,7 @@ def _ensure_core():
     core = build_core()
     set_current_core(core)
     for name in ("BulkProcess", "BulkStepper", "BulkScalarStepper",
-                 "IntAccumulator", "FloatAccumulator"):
+                 "IntAccumulator", "FloatAccumulator", "TickTrigger"):
         core.register_link(f"viva_core.conformance_processes.{name}",
                            getattr(cp, name))
     return core
