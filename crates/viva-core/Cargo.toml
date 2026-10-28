@@ -18,3 +18,4 @@ bigraph-schema-rs = { path = "../bigraph-schema-rs" }
 process-bigraph-rs = { path = "../process-bigraph-rs" }
 pyo3 = { version = "0.29.0", features = ["extension-module"] }
 numpy = "0.29"
+ndarray = "0.17.2"

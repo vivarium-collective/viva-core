@@ -80,6 +80,35 @@ class BenchBulkProcess(EcoliProcess):
         return {"bulk": [(idx, deltas)]}
 
 
+class BenchUniqueProcess(EcoliProcess):
+    """A fixed-timestep UNIQUE evolver for the M2 Task-2 benchmark: it runs
+    EVERY tick and READS a (large) unique structured array across the boundary
+    via the exact v2ecoli `attrs` idiom — `_entryState.view(bool)` mask then a
+    masked gather of a data field — which is the dominant per-tick unique copy
+    (`active_ribosome` ~13k rows). It returns `{}` (no write), so the number
+    isolates the READ-side cost: `build_structured_array` copy (before M2 Task 2)
+    vs. the zero-copy interleaved-buffer view (after)."""
+
+    name = "bench_unique_process"
+    config_schema = {}
+
+    def inputs(self):
+        return {"active": "node"}
+
+    def outputs(self):
+        return {}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        view = state["active"]
+        mask = view["_entryState"].view(np.bool_)
+        _ = view["unique_index"][mask]
+        _ = view["data0"][mask]
+        return {}
+
+
 class BulkProcess(EcoliProcess):
     """A v2ecoli-shaped *Process* (evolver) that reads `bulk["count"]` across the
     boundary and writes a vectorized `BulkNumpyUpdate` back — the carry-forward
@@ -202,3 +231,151 @@ class FloatAccumulator(EcoliStep):
 
     def update(self, state, interval=None):
         return {"value": float(self.parameters.get("rate", 1.0))}
+
+
+# Module-level capture for the zero-copy test: every tick the process records
+# facts about the `bulk` view it was handed (it runs in-process under both
+# engines, so the test can read this list afterwards).
+VIEW_LOG: list = []
+
+
+class ViewProbeProcess(EcoliProcess):
+    """Records, each tick, whether the bulk view it receives is the SAME memory
+    as the previous tick's view (zero-copy) and whether it is read-only. Also
+    checks the previous view still reflects the live store (a genuine view, not
+    a snapshot). Writes the same delta as :class:`BenchBulkProcess`."""
+
+    name = "view_probe_process"
+    config_schema = {}
+    _prev = None
+
+    def inputs(self):
+        return {"bulk": "bulk_array"}
+
+    def outputs(self):
+        return {"bulk": "bulk_array"}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        view = state["bulk"]
+        counts = np.asarray(view["count"])
+        rec = {
+            "names": view.dtype.names,
+            "writeable": bool(view.flags.writeable),
+            "counts": counts.copy(),
+        }
+        if ViewProbeProcess._prev is not None:
+            prev = ViewProbeProcess._prev
+            rec["shares_prev"] = bool(np.shares_memory(prev, view))
+            rec["prev_live"] = bool(np.array_equal(prev["count"], counts))
+        else:
+            rec["shares_prev"] = None
+            rec["prev_live"] = None
+        ViewProbeProcess._prev = view
+        VIEW_LOG.append(rec)
+        idx = np.arange(counts.shape[0], dtype=np.int64)
+        return {"bulk": [(idx, ((counts % 7) - 3).astype(np.int64))]}
+
+
+# Module-level capture for the M2 Task-2 UNIQUE zero-copy tests.
+UNIQUE_VIEW_LOG: list = []
+UNIQUE_REALLOC_LOG: list = []
+
+
+class UniqueViewProbe(EcoliProcess):
+    """Records, each tick, facts about the UNIQUE view it is handed: whether it
+    is the SAME memory as the previous tick's (zero-copy, non-vacuous), whether
+    it is read-only, its `dtype.names`, and its field reads (via the `attrs`
+    `_entryState.view(bool)` idiom). It writes NO unique update, so the store's
+    backing buffer is never mutated between ticks -> a genuine zero-copy view is
+    literally the same memory tick-over-tick (a per-tick copy would not be)."""
+
+    name = "unique_view_probe"
+    config_schema = {}
+    _prev = None
+
+    def inputs(self):
+        return {"active": "node"}
+
+    def outputs(self):
+        return {}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        view = state["active"]
+        mask = view["_entryState"].view(np.bool_)
+        rec = {
+            "names": view.dtype.names,
+            "writeable": bool(view.flags.writeable),
+            "field_shares_base": bool(np.shares_memory(view["unique_index"], view)),
+            "unique_index": view["unique_index"].tolist(),
+            "active_data0": view["data0"][mask].tolist(),
+        }
+        if UniqueViewProbe._prev is not None:
+            rec["shares_prev"] = bool(np.shares_memory(UniqueViewProbe._prev, view))
+            rec["prev_live"] = bool(
+                np.array_equal(UniqueViewProbe._prev["unique_index"],
+                               view["unique_index"])
+            )
+        else:
+            rec["shares_prev"] = None
+            rec["prev_live"] = None
+        UniqueViewProbe._prev = view
+        UNIQUE_VIEW_LOG.append(rec)
+        return {}
+
+
+class UniqueReallocProbe(EcoliProcess):
+    """Realloc-safety probe. Tick 0: STASH the view handed to it and a copy of
+    its fields, then emit an `add` that exhausts the free rows and forces the
+    backing buffer to GROW on flush (a realloc). Tick 1+: verify the STASHED
+    (pre-grow) view is still valid and still equals the pre-grow snapshot — i.e.
+    the grow did NOT free the memory the retained view points at (no
+    use-after-free). A wrong pin would surface here as garbage / a crash."""
+
+    name = "unique_realloc_probe"
+    config_schema = {}
+    _stash = None
+    _snapshot = None
+
+    def inputs(self):
+        return {"active": "node"}
+
+    def outputs(self):
+        return {"active": "node"}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        view = state["active"]
+        if UniqueReallocProbe._stash is None:
+            UniqueReallocProbe._stash = view
+            UniqueReallocProbe._snapshot = {
+                "nrows": int(len(view)),
+                "unique_index": view["unique_index"].copy(),
+                "data0": view["data0"].copy(),
+                "active_sum": int(view["_entryState"].view(np.bool_).sum()),
+            }
+            n_add = int(self.parameters.get("n_add", 5))
+            add = {"data0": [1000 + i for i in range(n_add)],
+                   "data1": [0.0] * n_add}
+            return {"active": {"add": add, "update": True}}
+        prev = UniqueReallocProbe._stash
+        snap = UniqueReallocProbe._snapshot
+        UNIQUE_REALLOC_LOG.append({
+            "grew": int(len(view)) > snap["nrows"],
+            "new_nrows": int(len(view)),
+            "old_nrows": snap["nrows"],
+            "stash_len_ok": int(len(prev)) == snap["nrows"],
+            "stash_unique_index_ok": bool(
+                np.array_equal(prev["unique_index"], snap["unique_index"])),
+            "stash_data0_ok": bool(np.array_equal(prev["data0"], snap["data0"])),
+            "stash_active_sum": int(prev["_entryState"].view(np.bool_).sum()),
+            "snap_active_sum": snap["active_sum"],
+        })
+        return {}

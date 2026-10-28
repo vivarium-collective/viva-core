@@ -2,13 +2,21 @@
 //! numpy structured-array view building, and update-dict -> typed [`Op`]
 //! translation.
 
+use std::sync::Arc;
+
+use ndarray::{aview1, Array1};
+use numpy::PyArray1;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{IntoPyDict, PyCapsule};
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 use bigraph_schema_rs::apply::{Op, UniqueOp};
 use bigraph_schema_rs::doc::{Map, Value};
 use bigraph_schema_rs::grammar::parse_type;
-use bigraph_schema_rs::state::{Column, State, StoreNode};
+use bigraph_schema_rs::state::{
+    read_value, FieldKind, FieldLayout, RecordLayout, State, StoreNode,
+};
 use bigraph_schema_rs::types::Type;
 use process_bigraph_rs::process::{PortUpdate, PortView};
 
@@ -139,20 +147,8 @@ pub fn storenode_to_py<'py>(
         }
         StoreNode::Bulk(b) => {
             if structured {
-                let mut cols: Vec<(String, &Column)> = Vec::new();
-                let count = Column::Int(b.count.clone());
-                let ids = Column::Str(b.ids.clone());
-                cols.push(("id".into(), &ids));
-                cols.push(("count".into(), &count));
-                let float_cols: Vec<(String, Column)> = b
-                    .floats
-                    .iter()
-                    .map(|(k, a)| (k.clone(), Column::Float(a.clone())))
-                    .collect();
-                for (k, c) in &float_cols {
-                    cols.push((k.clone(), c));
-                }
-                build_structured_array(py, &cols, dtypes.get(path))?
+                // M2 zero-copy: a read-only view over `BulkStore.count`.
+                bulk_count_view(py, &b.count)?
             } else {
                 let d = PyDict::new(py);
                 d.set_item("id", &b.ids)?;
@@ -165,13 +161,18 @@ pub fn storenode_to_py<'py>(
         }
         StoreNode::Unique(u) => {
             if structured {
-                let cols: Vec<(String, &Column)> =
-                    u.columns.iter().map(|(k, c)| (k.clone(), c)).collect();
-                build_structured_array(py, &cols, dtypes.get(path))?
+                // M2 Task 2: a read-only zero-copy view over the interleaved buffer.
+                unique_view(py, &u.buf, &u.layout, dtypes.get(path))?
             } else {
                 let d = PyDict::new(py);
-                for (k, c) in &u.columns {
-                    d.set_item(k, column_to_py(py, c)?)?;
+                let n = u.len();
+                let itemsize = u.layout.itemsize;
+                for fl in &u.layout.fields {
+                    let list = PyList::empty(py);
+                    for row in 0..n {
+                        list.append(value_to_py(py, &read_value(&u.buf, itemsize, row, fl))?)?;
+                    }
+                    d.set_item(&fl.name, list)?;
                 }
                 d.set_item("_metadata", u.metadata.to_string())?;
                 d.into_any()
@@ -180,66 +181,213 @@ pub fn storenode_to_py<'py>(
     })
 }
 
-fn column_to_py<'py>(py: Python<'py>, c: &Column) -> PyResult<Bound<'py, PyAny>> {
-    Ok(match c {
-        Column::Int(a) => a.to_vec().into_pyobject(py)?.into_any(),
-        Column::Float(a) => a.to_vec().into_pyobject(py)?.into_any(),
-        Column::Bool(v) => v.clone().into_pyobject(py)?.into_any(),
-        Column::Str(v) => v.clone().into_pyobject(py)?.into_any(),
-        Column::Nested(v) => {
-            let list = PyList::empty(py);
-            for x in v {
-                list.append(value_to_py(py, x)?)?;
-            }
-            list.into_any()
-        }
+/// Cached numpy dtype `[("count", "<i8")]` (built once, not per tick).
+fn count_dtype<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static DT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    DT.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let descr = PyList::new(py, [PyTuple::new(py, ["count", "<i8"])?])?;
+        Ok(py
+            .import("numpy")?
+            .getattr("dtype")?
+            .call1((descr,))?
+            .unbind())
     })
+    .map(|d| d.bind(py).clone())
 }
 
-/// Build a numpy structured array for a bulk/unique store, with the field
-/// dtypes from the original `.pbg` (so numpy views like
-/// `arr["_entryState"].view(bool)` behave exactly as in pb).
-fn build_structured_array<'py>(
+/// Zero-copy, READ-ONLY numpy structured-array view (`[("count","<i8")]`) over
+/// the Rust-owned `BulkStore.count` buffer. No allocation or copy: the array's
+/// data pointer is the `Array1<i64>`'s own storage.
+///
+/// Ownership/lifetime: Rust owns the buffer; the view is handed out for the
+/// duration of one process call. The buffer is only ever written in place by
+/// `Op::BulkDelta` (never reallocated mid-run) and only after the process has
+/// returned, so a view used inside the call can never dangle. The view is
+/// `writeable=False`: a process cannot mutate Rust state through it (writes go
+/// back as update dicts -> `Op::BulkDelta`). A process must not retain the view
+/// past the run (v2ecoli processes return updates; they do not stash views).
+fn bulk_count_view<'py>(py: Python<'py>, count: &Array1<i64>) -> PyResult<Bound<'py, PyAny>> {
+    if count.as_slice().is_none() {
+        // Non-contiguous (never produced by M1 loaders): fall back to a copy.
+        let owned = PyArray1::from_vec(py, count.to_vec());
+        return owned.call_method1("view", (count_dtype(py)?,));
+    }
+    let pin = PyCapsule::new_with_value(py, (), c"viva_core.bulk_pin")?;
+    // SAFETY: `count` is contiguous and outlives this call (see doc above); the
+    // array is made read-only before it is exposed.
+    let base = unsafe { PyArray1::borrow_from_array(count, pin.into_any()) };
+    base.call_method("setflags", (), Some(&[("write", false)].into_py_dict(py)?))?;
+    base.call_method1("view", (count_dtype(py)?,))
+}
+
+/// The `(name, dtype_str)` descriptor pairs for a unique store's record dtype,
+/// in `layout` field order, preferring the exact `.pbg` dtype string for each
+/// field (so numpy idioms like `arr["_entryState"].view(bool)` behave exactly as
+/// in pb), else the field kind's canonical numpy name.
+fn dtype_descr(
+    layout: &RecordLayout,
+    dtypes: Option<&Vec<(String, String)>>,
+) -> Vec<(String, String)> {
+    layout
+        .fields
+        .iter()
+        .map(|fl| {
+            let dt = dtypes
+                .and_then(|ds| {
+                    ds.iter()
+                        .find(|(n, _)| *n == fl.name)
+                        .map(|(_, d)| d.clone())
+                })
+                .unwrap_or_else(|| fl.kind.numpy_dtype().to_string());
+            (fl.name.clone(), dt)
+        })
+        .collect()
+}
+
+/// Process-wide cache of built record `np.dtype`s, keyed by descriptor
+/// signature. A unique store hands out a view every tick; rebuilding (and
+/// re-validating) the `PyArrayDescr` each time is pure Python-call overhead, so
+/// the dtype is built + offset-gated ONCE per distinct layout and reused.
+fn cached_record_dtype<'py>(
     py: Python<'py>,
-    columns: &[(String, &Column)],
+    layout: &RecordLayout,
     dtypes: Option<&Vec<(String, String)>>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let np = py.import("numpy")?;
-    let length = columns.first().map_or(0, |(_, c)| c.len());
+    static CACHE: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+    let cache = CACHE.get_or_try_init(py, || -> PyResult<Py<PyDict>> {
+        Ok(PyDict::new(py).unbind())
+    })?;
+    let cache = cache.bind(py);
 
-    // Build the dtype descriptor: [(name, dtype_str), ...]. Prefer the real
-    // `.pbg` dtype for each field; otherwise infer from the column kind.
-    let descr = PyList::empty(py);
-    for (name, col) in columns {
-        let dt = dtypes
-            .and_then(|ds| ds.iter().find(|(n, _)| n == name).map(|(_, d)| d.clone()))
-            .unwrap_or_else(|| infer_dtype(col, length));
-        if dt.starts_with('(') {
+    let descr = dtype_descr(layout, dtypes);
+    let key: String = descr
+        .iter()
+        .map(|(n, d)| format!("{n}={d}"))
+        .collect::<Vec<_>>()
+        .join(";");
+
+    if let Some(d) = cache.get_item(&key)? {
+        return Ok(d);
+    }
+
+    let np = py.import("numpy")?;
+    let descr_list = PyList::empty(py);
+    for (name, dt) in &descr {
+        descr_list.append(PyTuple::new(py, [name.as_str(), dt.as_str()])?)?;
+    }
+    let dtype = np.getattr("dtype")?.call1((descr_list,))?;
+
+    // Gate ONCE per distinct dtype: the record stride and every field offset,
+    // derived from the built PyArrayDescr, must match the Rust buffer layout, or
+    // field reads would silently corrupt.
+    let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
+    if itemsize != layout.itemsize {
+        return Err(perr(format!(
+            "unique dtype itemsize {itemsize} != Rust record stride {}",
+            layout.itemsize
+        )));
+    }
+    let fields_obj = dtype.getattr("fields")?;
+    for fl in &layout.fields {
+        let entry = fields_obj.get_item(&fl.name)?;
+        let offset: usize = entry.get_item(1)?.extract()?;
+        if offset != fl.offset {
             return Err(perr(format!(
-                "sub-array field dtype {dt:?} on {name:?} not yet supported in the \
-                 Python view (Task-5 scope: no model used needs it)"
+                "unique field {:?} numpy offset {offset} != Rust offset {}",
+                fl.name, fl.offset
             )));
         }
-        descr.append(PyTuple::new(py, [name.as_str(), dt.as_str()])?)?;
     }
-    let dtype = np.getattr("dtype")?.call1((descr,))?;
-    let arr = np.getattr("zeros")?.call1((length, dtype))?;
 
-    for (name, col) in columns {
-        let values = column_to_py(py, col)?;
-        arr.set_item(name.as_str(), values)?;
-    }
-    Ok(arr)
+    cache.set_item(&key, &dtype)?;
+    Ok(dtype)
 }
 
-fn infer_dtype(col: &Column, length: usize) -> String {
-    match col {
-        Column::Int(_) => "int64".into(),
-        Column::Float(_) => "float64".into(),
-        Column::Bool(_) => "bool".into(),
-        Column::Str(_) => format!("<U{}", length.max(1)),
-        Column::Nested(_) => "O".into(),
+/// READ-ONLY, zero-copy numpy structured-array view over a [`UniqueStore`]'s
+/// interleaved byte buffer.
+///
+/// # Lifetime / safety model (the realloc-safe pin)
+///
+/// The buffer is an `Arc<Vec<u8>>`. This view's numpy `base` is a `PyCapsule`
+/// that OWNS an `Arc` clone of that buffer, so the exact allocation this view's
+/// data pointer references stays alive for as long as the view (or any Python
+/// object derived from it) is alive — its refcount cannot reach zero first.
+///
+/// The buffer is mutated only by the unique apply path, and only through
+/// `Arc::make_mut`: once this view exists the Arc refcount is >= 2, so the next
+/// `set`/`add`/`delete`/grow **copies-on-write into a fresh allocation** and
+/// leaves this view's allocation untouched. Therefore a view handed to Python
+/// can never observe a reallocation of its own bytes and can never dangle, even
+/// if the process RETAINS it across the add/grow that reallocates the store
+/// (exercised by `test_unique_view_survives_realloc`). The retained view simply
+/// keeps showing the pre-mutation snapshot, which is sound because the view is
+/// read-only (`writeable=False`): writes go back as update dicts on the Op path.
+///
+/// Offsets are NOT hand-trusted: the record stride and every field offset are
+/// derived from a built `PyArrayDescr` and checked against the Rust `layout`
+/// (once per distinct dtype, in [`cached_record_dtype`]), so a layout/numpy
+/// disagreement fails loud instead of silently corrupting a field read.
+fn unique_view<'py>(
+    py: Python<'py>,
+    buf: &Arc<Vec<u8>>,
+    layout: &RecordLayout,
+    dtypes: Option<&Vec<(String, String)>>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let dtype = cached_record_dtype(py, layout, dtypes)?;
+
+    let np = py.import("numpy")?;
+    if buf.is_empty() {
+        // Zero rows: no bytes to borrow; hand back an empty structured array.
+        return np.getattr("zeros")?.call1((0usize, dtype));
     }
+
+    // Pin the CURRENT allocation by giving the view a base object that owns an
+    // Arc clone of the buffer (see the safety note above).
+    let pin = PyCapsule::new_with_value(py, Arc::clone(buf), c"viva_core.unique_pin")?;
+    let bytes: &[u8] = buf.as_slice();
+    let av = aview1(bytes);
+    // SAFETY: `av`'s data pointer is the pinned Arc allocation's bytes; the
+    // capsule keeps that allocation alive as long as the numpy array (and its
+    // views) live, and `Arc::make_mut` in apply copies-on-write rather than
+    // reallocating in place while this base is alive. The array is made
+    // read-only before exposure.
+    let base = unsafe { PyArray1::<u8>::borrow_from_array(&av, pin.into_any()) };
+    base.call_method("setflags", (), Some(&[("write", false)].into_py_dict(py)?))?;
+    base.call_method1("view", (dtype,))
+}
+
+/// Derive a [`RecordLayout`] from a built `PyArrayDescr` (rust-numpy): field
+/// offsets + record itemsize come straight from numpy, not hand arithmetic.
+/// Installed on each unique store at engine-build time so the runtime
+/// byte-offset arithmetic uses numpy-authoritative offsets.
+pub fn derive_layout(py: Python<'_>, dtypes: &[(String, String)]) -> PyResult<RecordLayout> {
+    let np = py.import("numpy")?;
+    let descr = PyList::empty(py);
+    for (name, dstr) in dtypes {
+        descr.append(PyTuple::new(py, [name.as_str(), dstr.as_str()])?)?;
+    }
+    let dtype = np.getattr("dtype")?.call1((descr,))?;
+    let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
+    let fields_obj = dtype.getattr("fields")?;
+    let mut fields = Vec::with_capacity(dtypes.len());
+    for (name, dstr) in dtypes {
+        let Some(kind) = FieldKind::from_dtype(dstr) else {
+            // Non-fixed-width field (string / sub-array): not a zero-copy unique
+            // store; skip deriving (the store kept its decoded layout).
+            return Err(perr(format!(
+                "unique field {name:?} dtype {dstr:?} is not fixed-width"
+            )));
+        };
+        let entry = fields_obj.get_item(name)?;
+        let offset: usize = entry.get_item(1)?.extract()?;
+        fields.push(FieldLayout {
+            name: name.clone(),
+            kind,
+            offset,
+            size: kind.size(),
+        });
+    }
+    Ok(RecordLayout { fields, itemsize })
 }
 
 /// Build the Python view dict handed to a process: each wired input port
