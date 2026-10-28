@@ -26,9 +26,12 @@ use std::sync::Arc;
 //
 // A [`UniqueStore`] is backed by ONE contiguous byte buffer in numpy's
 // (non-aligned / packed) record layout, so Python can view it zero-copy as a
-// genuine structured array. Every in-scope unique field is fixed-width
-// (int8/16/32/64, uint*, float32/64, bool) — unique stores carry no string or
-// sub-array fields (the Python view path has always rejected those).
+// genuine structured array. Every in-scope unique field is fixed-width: a scalar
+// (int8/16/32/64, uint*, float32/64, bool) OR a per-row 1-D sub-array of such a
+// scalar (`promoter.bound_TF` = `array[23,boolean]`, `chromosome_domain.
+// child_domains` = `array[2,integer]`) — a sub-array is still `elem_size *
+// prod(shape)` contiguous bytes per record. Unique stores carry no string
+// fields and no N-D sub-arrays (the Python view path rejects those).
 //
 // Endianness is little-endian: the real `.pbg` dtypes are native (`<`), and all
 // supported hosts are little-endian. Reads/writes below pack LE accordingly.
@@ -77,9 +80,9 @@ impl FieldKind {
         }
     }
 
-    /// Parse a numpy dtype string (`int8`/`<i8`/`float64`/`bool`/…) to a kind.
-    /// Returns `None` for non-fixed-width fields (strings, sub-arrays): those
-    /// are out of the zero-copy unique scope.
+    /// Parse a numpy SCALAR dtype string (`int8`/`<i8`/`float64`/`bool`/`?`/…)
+    /// to a kind. Returns `None` for a non-fixed-width element (strings) or a
+    /// compound/sub-array dtype — see [`parse_field_dtype`] for the sub-array form.
     pub fn from_dtype(d: &str) -> Option<FieldKind> {
         let d = d.trim_start_matches(['<', '>', '=', '|']);
         Some(match d {
@@ -99,12 +102,61 @@ impl FieldKind {
     }
 }
 
+/// Split a numpy 1-D sub-array dtype string `('<base', (n,))` into its base
+/// dtype string and element count. Returns `None` for a plain scalar dtype
+/// (no leading `(`), an N-D sub-array (shape tuple of length != 1 — out of the
+/// zero-copy scope), or a malformed string. Only 1-D sub-arrays of a
+/// fixed-width scalar element are in scope (`promoter.bound_TF` -> `('?', (23,))`,
+/// `chromosome_domain.child_domains` -> `('<i4', (2,))`).
+pub fn parse_subarray_dtype(d: &str) -> Option<(&str, usize)> {
+    let inner = d.trim().strip_prefix('(')?.strip_suffix(')')?;
+    // Base dtype, quoted: the substring between the first matched quote pair.
+    let q = inner.find(['\'', '"'])?;
+    let quote = inner.as_bytes()[q];
+    let rest = &inner[q + 1..];
+    let end = rest.bytes().position(|b| b == quote)?;
+    let base = &rest[..end];
+    // Shape tuple: the single parenthesized group after the base dtype.
+    let after = &rest[end + 1..];
+    let open = after.find('(')?;
+    let close = after[open..].find(')')? + open;
+    let mut dims = after[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::parse::<usize>);
+    let first = dims.next()?.ok()?;
+    if dims.next().is_some() {
+        return None; // N-D sub-array: out of the 1-D scope -> fail loud.
+    }
+    Some((base, first))
+}
+
+/// Parse a numpy FIELD dtype string into `(FieldKind, elems)`: a scalar dtype
+/// gives `(kind, 1)`; a 1-D sub-array dtype `('<i4', (2,))` gives `(kind, n)`.
+/// Returns `None` for a non-fixed-width element or an N-D sub-array (both out of
+/// the zero-copy unique scope — the caller fails loud). Shared by the decode and
+/// the layout-derivation seams so they always agree on field widths.
+pub fn parse_field_dtype(d: &str) -> Option<(FieldKind, usize)> {
+    match parse_subarray_dtype(d) {
+        Some((base, elems)) => Some((FieldKind::from_dtype(base)?, elems)),
+        // A leading `(` that didn't parse is an N-D / malformed sub-array: fail
+        // loud rather than fall through to the scalar parse.
+        None if d.trim_start().starts_with('(') => None,
+        None => Some((FieldKind::from_dtype(d)?, 1)),
+    }
+}
+
 /// One field's placement inside an interleaved record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldLayout {
     pub name: String,
     pub kind: FieldKind,
     pub offset: usize,
+    /// Scalar elements in this field: 1 for a scalar, `prod(shape)` for a
+    /// per-row sub-array (`array[n,...]`). Keeps `FieldKind` scalar + `Copy`.
+    pub elems: usize,
+    /// Byte width of the whole field: `kind.size() * elems`.
     pub size: usize,
 }
 
@@ -118,17 +170,20 @@ pub struct RecordLayout {
 
 impl RecordLayout {
     /// Pack fields in order with numpy's non-aligned rule: cumulative offsets,
-    /// no padding, `itemsize` = sum of sizes. (Verified against a built
-    /// `PyArrayDescr` on every view build; see `viva-core::convert`.)
-    pub fn packed(fields: Vec<(String, FieldKind)>) -> Self {
+    /// no padding, `itemsize` = sum of sizes. Each field is `(name, kind, elems)`
+    /// — `elems` is 1 for a scalar, `prod(shape)` for a per-row sub-array (its
+    /// width is `kind.size() * elems`). (Verified against a built `PyArrayDescr`
+    /// on every view build; see `viva-core::convert`.)
+    pub fn packed(fields: Vec<(String, FieldKind, usize)>) -> Self {
         let mut offset = 0;
         let mut out = Vec::with_capacity(fields.len());
-        for (name, kind) in fields {
-            let size = kind.size();
+        for (name, kind, elems) in fields {
+            let size = kind.size() * elems;
             out.push(FieldLayout {
                 name,
                 kind,
                 offset,
+                elems,
                 size,
             });
             offset += size;
@@ -144,11 +199,10 @@ impl RecordLayout {
     }
 }
 
-/// Write one coerced cell at `row` into the interleaved `buf` at `fl`'s offset,
-/// matching numpy's per-field cast of a scalar assignment.
-pub fn write_cell(buf: &mut [u8], itemsize: usize, row: usize, fl: &FieldLayout, v: &Value) {
-    let base = row * itemsize + fl.offset;
-    match fl.kind {
+/// Write one coerced scalar element of `kind` at byte offset `at`, matching
+/// numpy's per-field cast of a scalar assignment (LE).
+fn write_scalar(buf: &mut [u8], at: usize, kind: FieldKind, v: &Value) {
+    match kind {
         FieldKind::I8
         | FieldKind::I16
         | FieldKind::I32
@@ -159,27 +213,47 @@ pub fn write_cell(buf: &mut [u8], itemsize: usize, row: usize, fl: &FieldLayout,
         | FieldKind::U64 => {
             // LE two's-complement low bytes == numpy's int cast (mod 2^8k).
             let le = value_to_i64(v).to_le_bytes();
-            buf[base..base + fl.size].copy_from_slice(&le[..fl.size]);
+            buf[at..at + kind.size()].copy_from_slice(&le[..kind.size()]);
         }
         FieldKind::F32 => {
             let f = value_to_f64(v) as f32;
-            buf[base..base + 4].copy_from_slice(&f.to_le_bytes());
+            buf[at..at + 4].copy_from_slice(&f.to_le_bytes());
         }
         FieldKind::F64 => {
             let f = value_to_f64(v);
-            buf[base..base + 8].copy_from_slice(&f.to_le_bytes());
+            buf[at..at + 8].copy_from_slice(&f.to_le_bytes());
         }
         FieldKind::Bool => {
-            buf[base] = matches!(v, Value::Bool(true)) as u8;
+            buf[at] = matches!(v, Value::Bool(true)) as u8;
         }
     }
 }
 
-/// Read a cell as i64 (sign/zero-extended per kind). Bools read 0/1.
-pub fn read_i64(buf: &[u8], itemsize: usize, row: usize, fl: &FieldLayout) -> i64 {
+/// Write one coerced cell at `row` into the interleaved `buf` at `fl`'s offset.
+/// A scalar field (`elems == 1`) writes `v` directly; a sub-array field
+/// (`elems > 1`) expects `v` to be a [`Value::Array`] of `elems` elements and
+/// writes element `i` at `base + i * kind.size()` (LE, same per-element codec).
+/// A short/empty array leaves the trailing element bytes untouched (they start
+/// zeroed, matching `np.zeros`).
+pub fn write_cell(buf: &mut [u8], itemsize: usize, row: usize, fl: &FieldLayout, v: &Value) {
     let base = row * itemsize + fl.offset;
-    let b = &buf[base..base + fl.size];
-    match fl.kind {
+    if fl.elems == 1 {
+        write_scalar(buf, base, fl.kind, v);
+        return;
+    }
+    let es = fl.kind.size();
+    if let Value::Array(items) = v {
+        for (i, elem) in items.iter().take(fl.elems).enumerate() {
+            write_scalar(buf, base + i * es, fl.kind, elem);
+        }
+    }
+}
+
+/// Read one scalar element of `kind` at byte offset `at` as i64 (sign/zero-
+/// extended per kind). Bools read 0/1.
+fn read_scalar_i64(buf: &[u8], at: usize, kind: FieldKind) -> i64 {
+    let b = &buf[at..at + kind.size()];
+    match kind {
         FieldKind::I8 => b[0] as i8 as i64,
         FieldKind::I16 => i16::from_le_bytes([b[0], b[1]]) as i64,
         FieldKind::I32 => i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as i64,
@@ -194,16 +268,41 @@ pub fn read_i64(buf: &[u8], itemsize: usize, row: usize, fl: &FieldLayout) -> i6
     }
 }
 
+/// Read one scalar element of `kind` at byte offset `at` as a decoded [`Value`].
+fn read_scalar(buf: &[u8], at: usize, kind: FieldKind) -> Value {
+    match kind {
+        FieldKind::F32 => {
+            let b = &buf[at..at + 4];
+            Value::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64)
+        }
+        FieldKind::F64 => Value::Float(f64::from_le_bytes(buf[at..at + 8].try_into().unwrap())),
+        FieldKind::Bool => Value::Bool(buf[at] != 0),
+        _ => Value::Int(read_scalar_i64(buf, at, kind)),
+    }
+}
+
+/// Read a SCALAR cell as i64 (sign/zero-extended per kind). Bools read 0/1.
+/// Scalar-only: `unique_index`/`_entryState` and other scalar int fields; never
+/// called on a sub-array field (it would read only the first element).
+pub fn read_i64(buf: &[u8], itemsize: usize, row: usize, fl: &FieldLayout) -> i64 {
+    debug_assert_eq!(fl.elems, 1, "read_i64 on sub-array field {:?}", fl.name);
+    read_scalar_i64(buf, row * itemsize + fl.offset, fl.kind)
+}
+
 /// Read a cell as a decoded [`Value`] (for the non-structured state readback).
+/// A sub-array field (`elems > 1`) reads back a [`Value::Array`] of `elems`
+/// decoded elements (every element of the row), matching pb's `arr[f].tolist()`.
 pub fn read_value(buf: &[u8], itemsize: usize, row: usize, fl: &FieldLayout) -> Value {
     let base = row * itemsize + fl.offset;
-    let b = &buf[base..base + fl.size];
-    match fl.kind {
-        FieldKind::F32 => Value::Float(f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64),
-        FieldKind::F64 => Value::Float(f64::from_le_bytes(b.try_into().unwrap())),
-        FieldKind::Bool => Value::Bool(b[0] != 0),
-        _ => Value::Int(read_i64(buf, itemsize, row, fl)),
+    if fl.elems == 1 {
+        return read_scalar(buf, base, fl.kind);
     }
+    let es = fl.kind.size();
+    Value::Array(
+        (0..fl.elems)
+            .map(|i| read_scalar(buf, base + i * es, fl.kind))
+            .collect(),
+    )
 }
 
 /// Zero one whole record (numpy `result[row] = np.zeros(1, dtype)`).
@@ -360,9 +459,9 @@ impl UniqueStore {
     /// in column insertion order. Used by the plain-JSON classifier and the
     /// Rust oracle tests, where no explicit numpy dtype is carried.
     pub fn from_columns(columns: Map<Column>, metadata: i128) -> Self {
-        let fields: Vec<(String, FieldKind)> = columns
+        let fields: Vec<(String, FieldKind, usize)> = columns
             .iter()
-            .map(|(k, c)| (k.clone(), c.default_kind()))
+            .map(|(k, c)| (k.clone(), c.default_kind(), 1))
             .collect();
         let layout = RecordLayout::packed(fields);
         Self::from_columns_with_layout(layout, columns, metadata)
@@ -627,15 +726,16 @@ pub fn decode_structured(m: &Map<Value>) -> Option<StoreNode> {
     }
     if has("_entryState") && has("unique_index") {
         // Build the interleaved layout from the EXACT numpy dtype list (field
-        // order + fixed widths). Any non-fixed-width field (string / sub-array)
-        // is out of the zero-copy unique scope -> bail (treated as unsupported).
-        let mut layout_fields: Vec<(String, FieldKind)> = Vec::new();
+        // order + fixed widths). Scalars and 1-D sub-arrays of a fixed-width
+        // scalar element are in scope; any other non-fixed-width field (string /
+        // N-D sub-array) bails via `parse_field_dtype` -> `None` (unsupported).
+        let mut layout_fields: Vec<(String, FieldKind, usize)> = Vec::new();
         for (name, dstr) in &dtypes {
             if !columns.contains_key(name) {
                 continue;
             }
-            let kind = FieldKind::from_dtype(dstr)?;
-            layout_fields.push((name.clone(), kind));
+            let (kind, elems) = parse_field_dtype(dstr)?;
+            layout_fields.push((name.clone(), kind, elems));
         }
         let layout = RecordLayout::packed(layout_fields);
 

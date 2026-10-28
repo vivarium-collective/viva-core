@@ -263,6 +263,103 @@ fn run_report(py: Python<'_>, spec: &str, n_ticks: usize) -> PyResult<Py<PyDict>
     Ok(out.unbind())
 }
 
+/// Build an [`Engine`] from a Python->Rust composite handoff (Milestone 4): the
+/// state + topology come as two JSON specs (the state stores, and the
+/// process/step EDGES without their non-serializable configs), while the process
+/// instances themselves are handed over ALREADY CONSTRUCTED in `processes`
+/// (keyed by the edge's absolute path joined with `/`), carrying their live
+/// `sim_data`. Each edge becomes: a native twin (if its address is in
+/// `native_addresses` and `VIVA_NATIVE_PROCESSES` enables it), a builtin emitter
+/// (emitter addresses), or an instance-bound [`PyProcess`] driving the given
+/// instance. See [`run_prebuilt`].
+fn build_prebuilt_engine(
+    py: Python<'_>,
+    processes: &Bound<'_, PyDict>,
+    topology: &str,
+    state: &str,
+    native_addresses: &[String],
+) -> PyResult<Engine> {
+    // Merge the two specs into one composite: state stores first, then the edges.
+    let mut combined = load_spec(state)?;
+    let topo = load_spec(topology)?;
+    combined.root.extend(topo.root);
+
+    let mut dtype_map = collect_dtypes(&combined);
+    let mut st = from_initial(&combined);
+    collect_bulk_ids(py, &st.root, &mut Vec::new(), &mut dtype_map)?;
+    install_unique_layouts(py, &mut st.root, &mut Vec::new(), &dtype_map)?;
+    let dtypes = Arc::new(dtype_map);
+
+    let registry = ProcessRegistry::with_builtin_emitters();
+    let mut prebuilt: HashMap<Vec<String>, Box<dyn Process>> = HashMap::new();
+    for (path, edge) in combined.edges() {
+        let address = edge.address.clone();
+        // Emitters stay native Rust (handled by the registry fallback), exactly
+        // as on the JSON `run` path.
+        if is_emitter(&address) {
+            continue;
+        }
+        // Native-twin swap: only for an allow-listed address whose native ctor is
+        // also enabled by VIVA_NATIVE_PROCESSES (so one handoff runs either path).
+        if native_addresses.iter().any(|a| a == &address) {
+            if let Some(ctor) = processes::native_ctor(&address) {
+                let p = ctor(edge.config.as_ref())
+                    .map_err(|e| perr(format!("native {address}: {e}")))?;
+                prebuilt.insert(path, p);
+                continue;
+            }
+        }
+        // Otherwise: drive the pre-built Python instance bound to this edge.
+        let key = path.join("/");
+        let inst = processes.get_item(&key)?.ok_or_else(|| {
+            perr(format!(
+                "run_prebuilt: no pre-built instance for edge {key:?} (address {address})"
+            ))
+        })?;
+        let name = inst
+            .get_type()
+            .name()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| key.clone());
+        let pyproc = PyProcess::from_instance(inst, Arc::clone(&dtypes), name)
+            .map_err(|e| perr(format!("binding {key}: {e}")))?;
+        prebuilt.insert(path, Box::new(pyproc) as Box<dyn Process>);
+    }
+
+    Engine::with_prebuilt(&combined, st, &registry, prebuilt)
+        .map_err(|e| perr(format!("building prebuilt engine: {e}")))
+}
+
+/// Run a composite whose processes are handed over ALREADY CONSTRUCTED (the M4
+/// Python->Rust handoff), for `n_ticks` scheduler iterations, and return the
+/// decoded final state as a Python dict (same shape as [`run`]).
+///
+/// `processes`: `{edge_path: instance}` (edge path joined with `/`), each an
+/// already-built v2ecoli process/step carrying its live `sim_data` — NOT
+/// reconstructed from JSON (the whole point: 11 baseline process types carry
+/// non-serializable handles). `topology`: a JSON spec of ONLY the edges
+/// (`_type`/`address`/`inputs`/`outputs`/`interval`), configs omitted.
+/// `state`: a JSON spec of ONLY the data stores (bulk/unique as
+/// `__structured_array__`, scalars/maps inline). `native_addresses`: addresses
+/// to swap for their native twin (also gated by `VIVA_NATIVE_PROCESSES`).
+#[pyfunction]
+#[pyo3(signature = (processes, topology, state, n_ticks, native_addresses=None))]
+fn run_prebuilt(
+    py: Python<'_>,
+    processes: &Bound<'_, PyDict>,
+    topology: &str,
+    state: &str,
+    n_ticks: usize,
+    native_addresses: Option<Vec<String>>,
+) -> PyResult<Py<PyDict>> {
+    let native = native_addresses.unwrap_or_default();
+    let mut engine = build_prebuilt_engine(py, processes, topology, state, &native)?;
+    engine
+        .run(n_ticks)
+        .map_err(|e| perr(format!("running prebuilt engine: {e}")))?;
+    convert::state_to_py(py, &engine.state).map(|d| d.unbind())
+}
+
 /// Native-GLPK FBA primitives (only when built `--features glpk`). These expose
 /// the ported metabolism compute core to Python for the bit-identity oracle and
 /// the quadrant-2 benchmark: [`fba_solve`] (the LP solve, bit-identical to
@@ -362,6 +459,7 @@ mod fba_py {
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(run, m)?)?;
     m.add_function(wrap_pyfunction!(run_report, m)?)?;
+    m.add_function(wrap_pyfunction!(run_prebuilt, m)?)?;
     m.add_class::<rust_process::RustGrowCore>()?;
     #[cfg(feature = "glpk")]
     {

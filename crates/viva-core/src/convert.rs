@@ -15,7 +15,8 @@ use bigraph_schema_rs::apply::{Op, UniqueOp};
 use bigraph_schema_rs::doc::{Map, Value};
 use bigraph_schema_rs::grammar::parse_type;
 use bigraph_schema_rs::state::{
-    read_value, FieldKind, FieldLayout, RecordLayout, State, StoreNode,
+    parse_field_dtype, parse_subarray_dtype, read_value, FieldLayout, RecordLayout, State,
+    StoreNode,
 };
 use bigraph_schema_rs::types::Type;
 use process_bigraph_rs::process::{PortUpdate, PortView};
@@ -264,10 +265,38 @@ fn dtype_descr(
                         .find(|(n, _)| *n == fl.name)
                         .map(|(_, d)| d.clone())
                 })
-                .unwrap_or_else(|| fl.kind.numpy_dtype().to_string());
+                .unwrap_or_else(|| {
+                    // No explicit `.pbg` dtype: a scalar is its canonical numpy
+                    // name; a sub-array reconstructs the tuple form so its width
+                    // survives (sub-arrays normally carry an explicit dtype).
+                    if fl.elems > 1 {
+                        format!("('{}', ({},))", fl.kind.numpy_dtype(), fl.elems)
+                    } else {
+                        fl.kind.numpy_dtype().to_string()
+                    }
+                });
             (fl.name.clone(), dt)
         })
         .collect()
+}
+
+/// Append one numpy dtype `descr` entry for a field to `list`. A scalar field is
+/// a `(name, dtype)` 2-tuple; a 1-D sub-array field (`('<i4', (2,))`) becomes
+/// numpy's `(name, base_dtype, (elems,))` 3-tuple — the 2-tuple string form is
+/// rejected by `np.dtype`, and the 3-tuple is what makes numpy's own
+/// itemsize/offsets match the Rust sub-array layout (cross-checked below).
+fn push_descr_entry(
+    py: Python<'_>,
+    list: &Bound<'_, PyList>,
+    name: &str,
+    dstr: &str,
+) -> PyResult<()> {
+    if let Some((base, elems)) = parse_subarray_dtype(dstr) {
+        list.append((name, base, (elems,)).into_pyobject(py)?)?;
+    } else {
+        list.append(PyTuple::new(py, [name, dstr])?)?;
+    }
+    Ok(())
 }
 
 /// Process-wide cache of built record `np.dtype`s, keyed by descriptor
@@ -299,7 +328,7 @@ fn cached_record_dtype<'py>(
     let np = py.import("numpy")?;
     let descr_list = PyList::empty(py);
     for (name, dt) in &descr {
-        descr_list.append(PyTuple::new(py, [name.as_str(), dt.as_str()])?)?;
+        push_descr_entry(py, &descr_list, name, dt)?;
     }
     let dtype = np.getattr("dtype")?.call1((descr_list,))?;
 
@@ -390,16 +419,16 @@ pub fn derive_layout(py: Python<'_>, dtypes: &[(String, String)]) -> PyResult<Re
     let np = py.import("numpy")?;
     let descr = PyList::empty(py);
     for (name, dstr) in dtypes {
-        descr.append(PyTuple::new(py, [name.as_str(), dstr.as_str()])?)?;
+        push_descr_entry(py, &descr, name, dstr)?;
     }
     let dtype = np.getattr("dtype")?.call1((descr,))?;
     let itemsize: usize = dtype.getattr("itemsize")?.extract()?;
     let fields_obj = dtype.getattr("fields")?;
     let mut fields = Vec::with_capacity(dtypes.len());
     for (name, dstr) in dtypes {
-        let Some(kind) = FieldKind::from_dtype(dstr) else {
-            // Non-fixed-width field (string / sub-array): not a zero-copy unique
-            // store; skip deriving (the store kept its decoded layout).
+        let Some((kind, elems)) = parse_field_dtype(dstr) else {
+            // Non-fixed-width field (string / N-D sub-array): not a zero-copy
+            // unique store; fail loud (the store kept its decoded layout).
             return Err(perr(format!(
                 "unique field {name:?} dtype {dstr:?} is not fixed-width"
             )));
@@ -410,7 +439,8 @@ pub fn derive_layout(py: Python<'_>, dtypes: &[(String, String)]) -> PyResult<Re
             name: name.clone(),
             kind,
             offset,
-            size: kind.size(),
+            elems,
+            size: kind.size() * elems,
         });
     }
     Ok(RecordLayout { fields, itemsize })
