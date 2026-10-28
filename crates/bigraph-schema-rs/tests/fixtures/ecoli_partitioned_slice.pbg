@@ -1,0 +1,618 @@
+{
+  "global_time": 0.0,
+  "agents": {
+    "0": {
+      "bulk": {
+        "__structured_array__": true,
+        "dtype": [
+          [
+            "id",
+            "<U50"
+          ],
+          [
+            "count",
+            "int64"
+          ],
+          [
+            "rRNA_submass",
+            "float64"
+          ],
+          [
+            "tRNA_submass",
+            "float64"
+          ],
+          [
+            "mRNA_submass",
+            "float64"
+          ],
+          [
+            "miscRNA_submass",
+            "float64"
+          ],
+          [
+            "nonspecific_RNA_submass",
+            "float64"
+          ],
+          [
+            "protein_submass",
+            "float64"
+          ],
+          [
+            "metabolite_submass",
+            "float64"
+          ],
+          [
+            "water_submass",
+            "float64"
+          ],
+          [
+            "DNA_submass",
+            "float64"
+          ]
+        ],
+        "columns": {
+          "id": [
+            "--TRANS-ACENAPHTHENE-12-DIOL[c]",
+            "1-6-Galactofuran[c]",
+            "1-ACYLGLYCEROL-3-P-ACYLTRANSFER-MONOMER[i]",
+            "1-AMINO-PROPAN-2-OL[c]",
+            "1-AMINO-PROPAN-2-ONE-3-PHOSPHATE[c]",
+            "1-CHLORO-24-DINITROBENZENE[c]",
+            "1-DEOXYXYLONOJIRIMYCIN[c]",
+            "1-ETHYLADENINE[c]"
+          ],
+          "count": [
+            0,
+            0,
+            123,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "rRNA_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "tRNA_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "mRNA_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "miscRNA_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "nonspecific_RNA_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "protein_submass": [
+            0.0,
+            0.0,
+            4.560705585367286e-05,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "metabolite_submass": [
+            3.09208979698442e-07,
+            2.8111332289748734e-06,
+            0.0,
+            1.2639691271513884e-07,
+            2.7908015886363974e-07,
+            3.3634883021233137e-07,
+            2.2276961855670737e-07,
+            2.709700860595626e-07
+          ],
+          "water_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "DNA_submass": [
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "length": 8
+      },
+      "boundary": {
+        "external": {
+          "GLC": 11.101,
+          "ACET": 0.0,
+          "FUM": 0.0,
+          "MAL": 0.0,
+          "SUC": 0.0,
+          "OXYGEN-MOLECULE": Infinity,
+          "AMMONIUM": 30.272,
+          "NA+": 135.15,
+          "Pi": 63.851,
+          "K+": 21.883,
+          "SULFATE": 15.077,
+          "FE+2": Infinity,
+          "FE+3": 0.0031,
+          "CA+2": 0.09,
+          "CL-": 55.389,
+          "CO+2": Infinity,
+          "MG+2": 2.1,
+          "MN+2": Infinity,
+          "NI+2": Infinity,
+          "ZN+2": Infinity,
+          "WATER": Infinity,
+          "CARBON-DIOXIDE": Infinity,
+          "CPD0-1958": 0.0,
+          "L-SELENOCYSTEINE": Infinity,
+          "GLC-D-LACTONE": 0.0,
+          "CYTOSINE": 0.0,
+          "CYTIDINE": 0.0,
+          "ARABINOSE": 0.0,
+          "CPD-183": 0.0,
+          "INDOLE": 0.0,
+          "NITRATE": 0.0,
+          "NITRITE": 0.0,
+          "S-ADENOSYLMETHIONINE": 0.0,
+          "CPD-520": 0.0,
+          "TUNGSTATE": 0.0,
+          "L-ALPHA-ALANINE": 0.0,
+          "ARG": 0.0,
+          "ASN": 0.0,
+          "L-ASPARTATE": 0.0,
+          "CYS": 0.0,
+          "GLT": 0.0,
+          "GLN": 0.0,
+          "GLY": 0.0,
+          "HIS": 0.0,
+          "ILE": 0.0,
+          "LEU": 0.0,
+          "LYS": 0.0,
+          "MET": 0.0,
+          "PHE": 0.0,
+          "PRO": 0.0,
+          "SER": 0.0,
+          "THR": 0.0,
+          "TRP": 0.0,
+          "TYR": 0.0,
+          "VAL": 0.0,
+          "MI-PENTAKISPHOSPHATE": 0.0,
+          "HYPOXANTHINE": 0.0,
+          "CARBON-MONOXIDE": 0.0,
+          "HYDROGEN-MOLECULE": 0.0,
+          "5-Deoxy-D-Ribofuranose": 0.0,
+          "CPD-239": 0.0,
+          "UNDECAPRENYL-DIPHOSPHATE": 0.0,
+          "GLYCOLLATE": 0.0,
+          "CPD-10774": 0.0,
+          "BETAINE": 0.0,
+          "CH33ADO": 0.0,
+          "URACIL": 0.0,
+          "METOH": 0.0,
+          "CPD-1772": 0.0,
+          "4FE-4S": 0.0,
+          "CPD-560": 0.0,
+          "CPD-108": 0.0,
+          "THYMINE": 0.0,
+          "S-ADENOSYL-4-METHYLTHIO-2-OXOBUTANOATE": 0.0,
+          "UREA": 0.0,
+          "FORMATE": 0.0,
+          "D-ALANINE": 0.0,
+          "CPD-534": 0.0,
+          "GLYCEROL": 0.0,
+          "GLYCOLALDEHYDE": 0.0,
+          "D-LACTATE": 0.0,
+          "BUTANAL": 0.0,
+          "CPD-564": 0.0,
+          "XANTHINE": 0.0,
+          "PROTON": 0.0,
+          "ETOH": 0.0,
+          "IMIDAZOLE-PYRUVATE": 0.0,
+          "SULFATE_nan_probe": NaN
+        }
+      },
+      "environment": {
+        "exchange": {
+          "GLC": 0,
+          "ACET": 0,
+          "FUM": 0,
+          "MAL": 0,
+          "SUC": 0,
+          "OXYGEN-MOLECULE": 0,
+          "AMMONIUM": 0,
+          "NA+": 0,
+          "Pi": 0,
+          "K+": 0,
+          "SULFATE": 0,
+          "FE+2": 0,
+          "FE+3": 0,
+          "CA+2": 0,
+          "CL-": 0,
+          "CO+2": 0,
+          "MG+2": 0,
+          "MN+2": 0,
+          "NI+2": 0,
+          "ZN+2": 0,
+          "WATER": 0,
+          "CARBON-DIOXIDE": 0,
+          "CPD0-1958": 0,
+          "L-SELENOCYSTEINE": 0,
+          "GLC-D-LACTONE": 0,
+          "CYTOSINE": 0,
+          "CYTIDINE": 0,
+          "ARABINOSE": 0,
+          "CPD-183": 0,
+          "INDOLE": 0,
+          "NITRATE": 0,
+          "NITRITE": 0,
+          "S-ADENOSYLMETHIONINE": 0,
+          "CPD-520": 0,
+          "TUNGSTATE": 0,
+          "L-ALPHA-ALANINE": 0,
+          "ARG": 0,
+          "ASN": 0,
+          "L-ASPARTATE": 0,
+          "CYS": 0,
+          "GLT": 0,
+          "GLN": 0,
+          "GLY": 0,
+          "HIS": 0,
+          "ILE": 0,
+          "LEU": 0,
+          "LYS": 0,
+          "MET": 0,
+          "PHE": 0,
+          "PRO": 0,
+          "SER": 0,
+          "THR": 0,
+          "TRP": 0,
+          "TYR": 0,
+          "VAL": 0,
+          "MI-PENTAKISPHOSPHATE": 0,
+          "HYPOXANTHINE": 0,
+          "CARBON-MONOXIDE": 0,
+          "HYDROGEN-MOLECULE": 0,
+          "5-Deoxy-D-Ribofuranose": 0,
+          "CPD-239": 0,
+          "UNDECAPRENYL-DIPHOSPHATE": 0,
+          "GLYCOLLATE": 0,
+          "CPD-10774": 0,
+          "BETAINE": 0,
+          "CH33ADO": 0,
+          "URACIL": 0,
+          "METOH": 0,
+          "CPD-1772": 0,
+          "4FE-4S": 0,
+          "CPD-560": 0,
+          "CPD-108": 0,
+          "THYMINE": 0,
+          "S-ADENOSYL-4-METHYLTHIO-2-OXOBUTANOATE": 0,
+          "UREA": 0,
+          "FORMATE": 0,
+          "D-ALANINE": 0,
+          "CPD-534": 0,
+          "GLYCEROL": 0,
+          "GLYCOLALDEHYDE": 0,
+          "D-LACTATE": 0,
+          "BUTANAL": 0,
+          "CPD-564": 0,
+          "XANTHINE": 0,
+          "PROTON": 0,
+          "ETOH": 0,
+          "IMIDAZOLE-PYRUVATE": 0
+        },
+        "exchange_data": {
+          "unconstrained": [
+            "AMMONIUM[c]",
+            "CA+2[p]",
+            "CARBON-DIOXIDE[p]",
+            "CL-[p]",
+            "CO+2[p]",
+            "FE+2[p]",
+            "FE+3[p]",
+            "K+[p]",
+            "L-SELENOCYSTEINE[c]",
+            "MG+2[p]",
+            "MN+2[p]",
+            "NA+[p]",
+            "NI+2[p]",
+            "OXYGEN-MOLECULE[p]",
+            "Pi[p]",
+            "SULFATE[p]",
+            "WATER[p]",
+            "ZN+2[p]"
+          ],
+          "constrained": {
+            "GLC[p]": 20.0
+          }
+        },
+        "media_id": "minimal"
+      },
+      "global_time": 0.0,
+      "timestep": 1.0,
+      "ecoli-equilibrium": {
+        "_type": "step",
+        "address": "local:v2ecoli.processes.equilibrium.Equilibrium",
+        "inputs": {
+          "listeners": [
+            "listeners"
+          ],
+          "bulk": [
+            "bulk"
+          ],
+          "timestep": [
+            "timestep"
+          ],
+          "_layer_in_7": [
+            "_layer_token_6"
+          ]
+        },
+        "outputs": {
+          "listeners": [
+            "listeners"
+          ],
+          "bulk": [
+            "bulk"
+          ],
+          "timestep": [
+            "timestep"
+          ],
+          "_layer_out_7": [
+            "_layer_token_7"
+          ]
+        }
+      },
+      "ecoli-metabolism": {
+        "_type": "step",
+        "address": "local:v2ecoli.processes.metabolism.Metabolism",
+        "inputs": {
+          "bulk": [
+            "bulk"
+          ],
+          "bulk_total": [
+            "bulk"
+          ],
+          "listeners": [
+            "listeners"
+          ],
+          "environment": [
+            "environment"
+          ],
+          "boundary": [
+            "boundary"
+          ],
+          "polypeptide_elongation": [
+            "process_state",
+            "polypeptide_elongation"
+          ],
+          "global_time": [
+            "global_time"
+          ],
+          "timestep": [
+            "timestep"
+          ],
+          "next_update_time": [
+            "next_update_time",
+            "metabolism"
+          ],
+          "_layer_in_24": [
+            "_layer_token_23"
+          ]
+        },
+        "outputs": {
+          "bulk": [
+            "bulk"
+          ],
+          "bulk_total": [
+            "bulk"
+          ],
+          "listeners": [
+            "listeners"
+          ],
+          "environment": [
+            "environment"
+          ],
+          "boundary": [
+            "boundary"
+          ],
+          "polypeptide_elongation": [
+            "process_state",
+            "polypeptide_elongation"
+          ],
+          "global_time": [
+            "global_time"
+          ],
+          "timestep": [
+            "timestep"
+          ],
+          "next_update_time": [
+            "next_update_time",
+            "metabolism"
+          ],
+          "_layer_out_24": [
+            "_layer_token_24"
+          ]
+        }
+      },
+      "ecoli-mass-listener": {
+        "_type": "step",
+        "address": "local:v2ecoli.steps.listeners.mass_listener.MassListener",
+        "inputs": {
+          "bulk": [
+            "bulk"
+          ],
+          "unique": [
+            "unique"
+          ],
+          "listeners": [
+            "listeners"
+          ],
+          "global_time": [
+            "global_time"
+          ],
+          "timestep": [
+            "timestep"
+          ],
+          "_layer_in_26": [
+            "_layer_token_25"
+          ]
+        },
+        "outputs": {
+          "bulk": [
+            "bulk"
+          ],
+          "unique": [
+            "unique"
+          ],
+          "listeners": [
+            "listeners"
+          ],
+          "global_time": [
+            "global_time"
+          ],
+          "timestep": [
+            "timestep"
+          ],
+          "_layer_out_26": [
+            "_layer_token_26"
+          ]
+        }
+      },
+      "emitter": {
+        "_type": "step",
+        "address": "local:process_bigraph.emitter.RAMEmitter",
+        "inputs": {
+          "global_time": [
+            "global_time"
+          ],
+          "bulk": [
+            "bulk"
+          ],
+          "listeners": [
+            "listeners"
+          ],
+          "full_chromosome": [
+            "unique",
+            "full_chromosome"
+          ],
+          "active_replisome": [
+            "unique",
+            "active_replisome"
+          ],
+          "active_RNAP": [
+            "unique",
+            "active_RNAP"
+          ],
+          "chromosome_domain": [
+            "unique",
+            "chromosome_domain"
+          ],
+          "_layer_in_28": [
+            "_layer_token_27"
+          ]
+        },
+        "outputs": {
+          "global_time": [
+            "global_time"
+          ],
+          "bulk": [
+            "bulk"
+          ],
+          "listeners": [
+            "listeners"
+          ],
+          "full_chromosome": [
+            "unique",
+            "full_chromosome"
+          ],
+          "active_replisome": [
+            "unique",
+            "active_replisome"
+          ],
+          "active_RNAP": [
+            "unique",
+            "active_RNAP"
+          ],
+          "chromosome_domain": [
+            "unique",
+            "chromosome_domain"
+          ],
+          "_layer_out_28": [
+            "_layer_token_28"
+          ]
+        }
+      },
+      "global_clock": {
+        "_type": "process",
+        "address": "local:v2ecoli.steps.global_clock.GlobalClock",
+        "inputs": {
+          "global_time": [
+            "global_time"
+          ],
+          "next_update_time": [
+            "next_update_time"
+          ],
+          "_layer_in_29": [
+            "_layer_token_28"
+          ]
+        },
+        "outputs": {
+          "global_time": [
+            "global_time"
+          ],
+          "next_update_time": [
+            "next_update_time"
+          ],
+          "_layer_out_29": [
+            "_layer_token_29"
+          ]
+        }
+      }
+    }
+  }
+}
