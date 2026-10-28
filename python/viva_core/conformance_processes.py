@@ -255,6 +255,65 @@ class FloatAccumulator(EcoliStep):
         return {"value": float(self.parameters.get("rate", 1.0))}
 
 
+class SubArrayUpdater(EcoliProcess):
+    """Drives the two unique stores that carry per-row SUB-ARRAY fields —
+    ``chromosome_domain`` (``child_domains: array[2,integer]``) and ``promoter``
+    (``bound_TF: array[23,boolean]``) — across the boundary, emitting a combined
+    ``set``/``add``/``delete``/``update`` unique update every tick. It READS each
+    store's view (so a wrong sub-array decode diverges) and WRITES deterministic,
+    interval-independent sub-array values keyed off the live active count (so both
+    a wrong read and a wrong write diverge).
+
+    A Process (not a Step): it shares the clock-locked timestep (``min(next -
+    global_time)``), so both engines invoke it the same number of times — a Step
+    that writes a store it reads would re-trigger a different number of times
+    across the engines (see :class:`BulkProcess`)."""
+
+    name = "subarray_updater"
+    config_schema = {}
+
+    def inputs(self):
+        return {"chromosome_domain": "node", "promoter": "node",
+                "global_time": "float", "next_update_time": "map[float]"}
+
+    def outputs(self):
+        # The real v2ecoli unique types (UniqueNumpyUpdate apply), so pb
+        # accumulates + flushes set/add/delete identically to the Rust updater.
+        from v2ecoli.library.schema_types import UNIQUE_TYPES
+        return {"chromosome_domain": UNIQUE_TYPES["chromosome_domain"],
+                "promoter": UNIQUE_TYPES["promoter"]}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        view = interval_or_states if states is None else states
+        return min(nt - view["global_time"]
+                   for nt in view["next_update_time"].values())
+
+    def update(self, state, interval=None):
+        out = {}
+        for mol in ("chromosome_domain", "promoter"):
+            view = state.get(mol)
+            if view is None:
+                continue
+            act = int(np.asarray(view["_entryState"]).view(np.bool_).sum())
+            upd = {"update": True}
+            if mol == "chromosome_domain":
+                # set child_domains per active molecule; add 2; delete the first.
+                upd["set"] = {"child_domains": [[100 + i, 200 + i]
+                                                for i in range(act)]}
+                upd["add"] = {"domain_index": [7, 8],
+                              "child_domains": [[1, 2], [3, 4]]}
+            else:
+                upd["set"] = {"bound_TF": [[(i + j) % 2 == 0 for j in range(23)]
+                                           for i in range(act)]}
+                upd["add"] = {"TU_index": [5, 6],
+                              "bound_TF": [[j % 3 == 0 for j in range(23)],
+                                           [j % 2 == 0 for j in range(23)]]}
+            if act >= 1:
+                upd["delete"] = [0]
+            out[mol] = upd
+        return out
+
+
 # Module-level capture for the zero-copy test: every tick the process records
 # facts about the `bulk` view it was handed (it runs in-process under both
 # engines, so the test can read this list afterwards).
@@ -304,6 +363,68 @@ class ViewProbeProcess(EcoliProcess):
 # Module-level capture for the M2 Task-2 UNIQUE zero-copy tests.
 UNIQUE_VIEW_LOG: list = []
 UNIQUE_REALLOC_LOG: list = []
+
+# Module-level capture for the M4 sub-array realloc-safety test.
+SUBARRAY_VIEW_LOG: list = []
+
+
+class SubArrayViewProbe(EcoliProcess):
+    """Sub-array realloc-safety probe. Tick 0: STASH the view handed to it and a
+    copy of its ``child_domains`` sub-array field, then emit a ``set`` (mutating
+    existing rows' sub-array) plus an ``add`` that exhausts the free rows and
+    forces the backing buffer to GROW on flush. Tick 1+: verify the STASHED
+    (pre-mutation) view still reads its ORIGINAL sub-array bytes element-for-
+    element — the copy-on-write (`Arc::make_mut`) left the pinned allocation
+    untouched — while the LIVE view reflects the mutation."""
+
+    name = "subarray_view_probe"
+    config_schema = {}
+    _stash = None
+    _snapshot = None
+
+    def inputs(self):
+        return {"active": "node"}
+
+    def outputs(self):
+        return {"active": "node"}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        view = state["active"]
+        if SubArrayViewProbe._stash is None:
+            SubArrayViewProbe._stash = view
+            SubArrayViewProbe._snapshot = {
+                "nrows": int(len(view)),
+                "child_domains": view["child_domains"].copy(),
+                "unique_index": view["unique_index"].copy(),
+            }
+            act = int(view["_entryState"].view(np.bool_).sum())
+            n_add = int(self.parameters.get("n_add", 5))
+            return {"active": {
+                "set": {"child_domains": [[i, i] for i in range(act)]},
+                "add": {"domain_index": list(range(n_add)),
+                        "child_domains": [[900 + i, 800 + i] for i in range(n_add)]},
+                "update": True,
+            }}
+        prev = SubArrayViewProbe._stash
+        snap = SubArrayViewProbe._snapshot
+        SUBARRAY_VIEW_LOG.append({
+            "grew": int(len(view)) > snap["nrows"],
+            "new_nrows": int(len(view)),
+            "old_nrows": snap["nrows"],
+            # The RETAINED pre-mutation view still reads its ORIGINAL sub-array
+            # bytes (no use-after-free, no in-place overwrite of the pinned buf).
+            "stash_child_domains_ok": bool(
+                np.array_equal(prev["child_domains"], snap["child_domains"])),
+            "stash_unique_index_ok": bool(
+                np.array_equal(prev["unique_index"], snap["unique_index"])),
+            # ... and the LIVE view reflects the set mutation on the old rows.
+            "live_changed": not bool(np.array_equal(
+                view["child_domains"][:snap["nrows"]], snap["child_domains"])),
+        })
+        return {}
 
 
 class UniqueViewProbe(EcoliProcess):

@@ -42,10 +42,13 @@ EPS = 1e-12
 CACHE = os.environ.get(
     "V2ECOLI_CACHE", "/Users/eranagmon/code/v2ecoli/out/cache"
 )
-# Simple unique stores only — the Rust zero-copy unique decode does not yet
-# handle sub-array fields (`promoter.bound_TF`, `chromosome_domain.child_domains`),
-# a Task-3 scale-up concern; these stores have none.
-SIMPLE_UNIQUE = ["oriC", "DnaA_box", "active_replisome", "full_chromosome"]
+# Unique stores exercised across the handoff. The first four are fixed-width
+# scalar fields; `promoter` and `chromosome_domain` carry per-row SUB-ARRAY
+# fields (`promoter.bound_TF` = array[23,boolean], `chromosome_domain.
+# child_domains` = array[2,integer]) — decoded/viewed/read-back by M4 Task 2, so
+# the whole-model `run_prebuilt` no longer has to skip them.
+SIMPLE_UNIQUE = ["oriC", "DnaA_box", "active_replisome", "full_chromosome",
+                 "promoter", "chromosome_domain"]
 EDGES = ["global_clock", "ecoli-protein-degradation", "replication_data_listener"]
 STORES = ["global_time", "timestep", "bulk"]
 
