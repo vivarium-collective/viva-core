@@ -3,6 +3,7 @@
 
 pub mod emitter;
 pub mod engine;
+pub mod parallel;
 pub mod process;
 pub mod registry;
 pub mod schedule;

@@ -8,6 +8,15 @@ description = "Rust scheduler, tick loop and emitters mirroring process-bigraph 
 [dependencies]
 bigraph-schema-rs = { path = "../bigraph-schema-rs" }
 thiserror = "1"
+rayon = "1.10"
+# rsmpi links the system MPI (Homebrew Open MPI 5: `brew install open-mpi`);
+# it finds it via `mpicc` on PATH, no env var needed. Used only by the
+# standalone `mpi_smoke` binary, never by the PyO3 cdylib (viva-core).
+mpi = "0.8"
+
+[[bin]]
+name = "mpi_smoke"
+path = "src/bin/mpi_smoke.rs"
 
 [dev-dependencies]
 serde_json = "1"
