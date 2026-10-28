@@ -23,7 +23,7 @@ use pyo3::types::{PyBool, PyDict, PyList, PyTuple};
 
 use bigraph_schema_rs::codec;
 use bigraph_schema_rs::doc::{CompositeSpec, Map, Node, TagKind, Value};
-use bigraph_schema_rs::state::from_initial;
+use bigraph_schema_rs::state::{from_initial, StoreNode};
 use process_bigraph_rs::engine::Engine;
 use process_bigraph_rs::process::Process;
 use process_bigraph_rs::registry::ProcessRegistry;
@@ -95,9 +95,38 @@ fn collect_dtypes(spec: &CompositeSpec) -> DtypeMap {
 /// Build the engine for a spec: decode the initial state (incl. tagged
 /// structured arrays) and register a [`PyProcess`] factory for every `local:`
 /// Python edge (emitters stay native Rust).
+/// Walk the state tree and install each unique store's PyArrayDescr-derived
+/// record layout (field offsets + itemsize straight from numpy), so the runtime
+/// byte-offset arithmetic uses numpy-authoritative offsets rather than any
+/// hand-computed ones. A no-op re-pack when the decoded layout already matches
+/// numpy's packed layout (the common case).
+fn install_unique_layouts(
+    py: Python<'_>,
+    m: &mut Map<StoreNode>,
+    path: &mut Vec<String>,
+    dtypes: &DtypeMap,
+) -> PyResult<()> {
+    for (k, n) in m.iter_mut() {
+        path.push(k.clone());
+        match n {
+            StoreNode::Branch(b) => install_unique_layouts(py, b, path, dtypes)?,
+            StoreNode::Unique(u) => {
+                if let Some(ds) = dtypes.get(path.as_slice()) {
+                    let layout = convert::derive_layout(py, ds)?;
+                    u.relayout(layout);
+                }
+            }
+            _ => {}
+        }
+        path.pop();
+    }
+    Ok(())
+}
+
 fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
     let dtypes = Arc::new(collect_dtypes(spec));
-    let state = from_initial(spec);
+    let mut state = from_initial(spec);
+    Python::attach(|py| install_unique_layouts(py, &mut state.root, &mut Vec::new(), &dtypes))?;
 
     let mut registry = ProcessRegistry::with_builtin_emitters();
     let mut addresses: Vec<String> = Vec::new();

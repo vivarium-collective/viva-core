@@ -3,7 +3,7 @@
 //! `metadata` initialisation from the max existing `unique_index`.
 
 use bigraph_schema_rs::codec::from_json;
-use bigraph_schema_rs::state::{from_initial, Column, StoreNode};
+use bigraph_schema_rs::state::{from_initial, StoreNode};
 
 /// A real `.pbg` delivers the bulk store as a tagged structured array; it must
 /// lift into a `Bulk` store with the decoded `count`/`id` columns.
@@ -57,8 +57,8 @@ fn decodes_unique_and_inits_metadata_from_max_index() {
     assert_eq!(store.len(), 2);
     // metadata = max(unique_index) + 1 = 99 + 1.
     assert_eq!(store.metadata, 100);
-    match store.columns.get("unique_index") {
-        Some(Column::Int(a)) => assert_eq!(a.to_vec(), vec![41, 99]),
-        other => panic!("unique_index column wrong: {other:?}"),
-    }
+    assert_eq!(store.int_col_vec("unique_index"), vec![41, 99]);
+    assert_eq!(store.int_col_vec("domain_index"), vec![1, 2]);
+    // The int8/int64 field widths are preserved in the interleaved layout.
+    assert_eq!(store.layout.itemsize, 4 + 1 + 8); // int32 + int8 + int64
 }

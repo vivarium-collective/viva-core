@@ -110,9 +110,12 @@ fn apply_unique_set_add_delete() {
     //   _entryState = [0, 1,   1,   0, 1,   1,   1]
     //   unique_index= [0, 1,   6,   0, 7,   5,   8]
     //   metadata    = 9
-    assert_eq!(u.int_col("TU_index"), &[0, 201, 900, 0, 901, 205, 902]);
-    assert_eq!(u.int_col("_entryState"), &[0, 1, 1, 0, 1, 1, 1]);
-    assert_eq!(u.int_col("unique_index"), &[0, 1, 6, 0, 7, 5, 8]);
+    assert_eq!(
+        u.int_col_vec("TU_index"),
+        vec![0, 201, 900, 0, 901, 205, 902]
+    );
+    assert_eq!(u.int_col_vec("_entryState"), vec![0, 1, 1, 0, 1, 1, 1]);
+    assert_eq!(u.int_col_vec("unique_index"), vec![0, 1, 6, 0, 7, 5, 8]);
     assert_eq!(u.metadata, 9);
 }
 
@@ -223,7 +226,7 @@ fn from_initial_builds_stores() {
     let StoreNode::Unique(u) = state.get(&["unique"]).unwrap() else {
         panic!("unique")
     };
-    assert_eq!(u.int_col("TU_index"), &[5, 0]);
+    assert_eq!(u.int_col_vec("TU_index"), vec![5, 0]);
 }
 
 /// An unresolved type name fails loud (never silently defaults): `resolve`

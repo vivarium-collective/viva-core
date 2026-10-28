@@ -165,8 +165,17 @@ fn accumulate_unique(store: &mut UniqueStore, u: &UniqueOp) {
         .extend(u.delete.iter().filter(|d| !d.is_empty()).cloned());
 }
 
-/// Flush the accumulated set/add/delete in the exact vEcoli order.
+/// Flush the accumulated set/add/delete in the exact vEcoli order, operating on
+/// the interleaved record buffer via field-offset + record-stride arithmetic.
+///
+/// Every buffer mutation goes through [`Arc::make_mut`]: if a Python view still
+/// pins the buffer, the first mutation of the flush copies-on-write into a fresh
+/// allocation (the retained view keeps the old one), so the layout change is
+/// bit-identical to the former columnar path AND realloc-safe.
 fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyError> {
+    use crate::state::write_cell;
+    use std::sync::Arc;
+
     let st = std::mem::take(&mut store.updater);
 
     // Active rows at the start of the flush; snapshotted *before* any add so
@@ -176,11 +185,14 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
 
     // 1. set — write to the rows active at the start of the layer.
     for set in &st.set {
+        let layout = &store.layout;
+        let itemsize = layout.itemsize;
+        let buf = Arc::make_mut(&mut store.buf);
         for (field, vals) in set {
-            if let Some(col) = store.columns.get_mut(field) {
+            if let Some(fl) = layout.field(field) {
                 for (k, &row) in active_idx.iter().enumerate() {
                     if let Some(v) = vals.get(k) {
-                        col.write(row, v);
+                        write_cell(buf, itemsize, row, fl, v);
                     }
                 }
             }
@@ -194,42 +206,53 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
             continue;
         }
         let free = store.get_free_indices(n_new);
+        let itemsize = store.layout.itemsize;
 
         if !add.contains_key("unique_index") {
             let base = store.metadata;
-            if let Some(crate::state::Column::Int(ui)) = store.columns.get_mut("unique_index") {
+            if let Some(fl) = store.layout.field("unique_index").cloned() {
+                let buf = Arc::make_mut(&mut store.buf);
                 for (k, &row) in free.iter().enumerate() {
                     let idx = base + k as i128;
-                    ui[row] = i64::try_from(idx).map_err(|_| ApplyError::Overflow {
+                    let x = i64::try_from(idx).map_err(|_| ApplyError::Overflow {
                         path: path.to_vec(),
                     })?;
+                    write_cell(buf, itemsize, row, &fl, &Value::Int(x));
                 }
             }
             store.metadata = base + n_new as i128;
         }
 
-        for (field, vals) in add {
-            if let Some(col) = store.columns.get_mut(field) {
-                for (k, &row) in free.iter().enumerate() {
-                    if let Some(v) = vals.get(k) {
-                        col.write(row, v);
+        {
+            let layout = &store.layout;
+            let buf = Arc::make_mut(&mut store.buf);
+            for (field, vals) in add {
+                if let Some(fl) = layout.field(field) {
+                    for (k, &row) in free.iter().enumerate() {
+                        if let Some(v) = vals.get(k) {
+                            write_cell(buf, itemsize, row, fl, v);
+                        }
                     }
                 }
             }
         }
-        if let Some(crate::state::Column::Int(es)) = store.columns.get_mut("_entryState") {
+
+        if let Some(fl) = store.layout.field("_entryState").cloned() {
+            let buf = Arc::make_mut(&mut store.buf);
             for &row in &free {
-                es[row] = 1;
+                write_cell(buf, itemsize, row, &fl, &Value::Int(1));
             }
         }
     }
 
-    // 3. delete — zero the rows selected from the pre-add active snapshot.
-    for del in &st.delete {
-        for &d in del {
-            let row = initially_active[d];
-            for col in store.columns.values_mut() {
-                col.zero_at(row);
+    // 3. delete — zero the whole record of each row selected from the pre-add
+    // active snapshot (numpy `result[row] = np.zeros(1, dtype)`).
+    if !st.delete.is_empty() {
+        let itemsize = store.layout.itemsize;
+        let buf = Arc::make_mut(&mut store.buf);
+        for del in &st.delete {
+            for &d in del {
+                crate::state::zero_record(buf, itemsize, initially_active[d]);
             }
         }
     }

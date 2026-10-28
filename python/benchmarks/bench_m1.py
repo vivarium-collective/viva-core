@@ -52,6 +52,30 @@ def _bench_doc(n_bulk: int) -> dict:
     }
 
 
+def _bench_doc_unique(n_unique: int) -> dict:
+    """A large UNIQUE structured-array composite (M2 Task 2): one Python evolver
+    reads a `n_unique`-row unique store each tick via the `attrs` idiom. Measures
+    the unique read-view cost (copy before Task 2 -> zero-copy after)."""
+    dt = np.dtype([("data0", "int64"), ("data1", "float64"),
+                   ("_entryState", "int8"), ("unique_index", "int64")])
+    arr = np.zeros(n_unique, dtype=dt)
+    arr["data0"] = np.arange(n_unique, dtype=np.int64)
+    arr["data1"] = np.arange(n_unique, dtype=np.float64)
+    arr["_entryState"] = 1
+    arr["unique_index"] = np.arange(n_unique, dtype=np.int64)
+    return {
+        "global_time": 0.0,
+        "active": arr,
+        "bench": {
+            "_type": "process",
+            "address": "local:viva_core.conformance_processes.BenchUniqueProcess",
+            "config": {"dt": 1.0},
+            "inputs": {"active": ["active"]},
+            "outputs": {},
+        },
+    }
+
+
 def _bench_doc_scalar() -> dict:
     """Scalar-only composite: NO structured array crosses the boundary, so it
     isolates engine + PyO3-callback overhead without the per-tick array copy."""
@@ -116,13 +140,16 @@ def _measure(doc_fn, address_cls, n_ticks: int, warmup: int, repeats: int) -> di
     }
 
 
-def run(n_ticks: int = 2000, n_bulk: int = 200, warmup: int = 2, repeats: int = 5) -> dict:
+def run(n_ticks: int = 2000, n_bulk: int = 200, n_unique: int = 2000,
+        warmup: int = 2, repeats: int = 5) -> dict:
     bulk = _measure(lambda: _bench_doc(n_bulk), ("BenchBulkProcess", None),
                     n_ticks, warmup, repeats)
+    unique = _measure(lambda: _bench_doc_unique(n_unique),
+                      ("BenchUniqueProcess", None), n_ticks, warmup, repeats)
     scalar = _measure(_bench_doc_scalar, ("BenchScalarProcess", None),
                       n_ticks, warmup, repeats)
-    return {"n_ticks": n_ticks, "n_bulk": n_bulk, "repeats": repeats,
-            "bulk": bulk, "scalar": scalar}
+    return {"n_ticks": n_ticks, "n_bulk": n_bulk, "n_unique": n_unique,
+            "repeats": repeats, "bulk": bulk, "unique": unique, "scalar": scalar}
 
 
 def main() -> None:
@@ -136,6 +163,12 @@ def main() -> None:
     print(f"     Python engine + Python procs : {r['bulk']['pb_tps']:>12.1f} ticks/s")
     print(f"     day-one ratio (Rust / Py)    : {r['bulk']['ratio']:>12.3f}x "
           "(UPPER BOUND on overhead / LOWER BOUND on speedup)")
+    print()
+    print("A2. UNIQUE structured-array composite (1 Python unique-evolver, "
+          f"unique n={r['n_unique']}) - the per-tick unique read view (M2 Task 2):")
+    print(f"     Rust engine   + Python procs : {r['unique']['rust_tps']:>12.1f} ticks/s")
+    print(f"     Python engine + Python procs : {r['unique']['pb_tps']:>12.1f} ticks/s")
+    print(f"     day-one ratio (Rust / Py)    : {r['unique']['ratio']:>12.3f}x")
     print()
     print("B. Scalar-only composite (no array crosses the boundary) - "
           "pure engine + PyO3-callback delta:")
