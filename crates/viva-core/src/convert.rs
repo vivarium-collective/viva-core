@@ -12,7 +12,7 @@ use pyo3::types::{IntoPyDict, PyCapsule};
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 use bigraph_schema_rs::apply::{Op, UniqueOp};
-use bigraph_schema_rs::doc::{Map, Value};
+use bigraph_schema_rs::doc::{Map, TagKind, Value};
 use bigraph_schema_rs::grammar::parse_type;
 use bigraph_schema_rs::state::{
     parse_field_dtype, parse_subarray_dtype, read_value, FieldLayout, RecordLayout, State,
@@ -45,6 +45,10 @@ pub fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny
             }
             list.into_any()
         }
+        // A pint Quantity leaf: rebuild a real `pint.Quantity` (Option A) rather
+        // than hand back a plain dict, restoring the magnitude dtype so a reader
+        // gets `np.float64` not a demoted Python `float`.
+        Value::Tagged(TagKind::Pint, m) => pint_to_py(py, m)?,
         Value::Map(m) | Value::Tagged(_, m) => {
             let d = PyDict::new(py);
             for (k, x) in m {
@@ -53,6 +57,150 @@ pub fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny
             d.into_any()
         }
     })
+}
+
+// ---- pint Quantity bridge (Option A: opaque tag in Rust, wrap/unwrap here) --
+
+/// Cached `bigraph_schema.units.get_quantity_registry()` handle — the registry
+/// v2ecoli installs as the pint application registry, so decoded Quantities are
+/// registry-coherent with v2ecoli's (incl. units like `amino_acid`).
+fn quantity_registry<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static REG: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    REG.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py
+            .import("bigraph_schema.units")?
+            .getattr("get_quantity_registry")?
+            .call0()?
+            .unbind())
+    })
+    .map(|r| r.bind(py).clone())
+}
+
+/// Cached `pint.Quantity` base class for the `isinstance` check in `py_to_value`.
+fn pint_quantity_cls<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    CLS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("pint")?.getattr("Quantity")?.unbind())
+    })
+    .map(|c| c.bind(py).clone())
+}
+
+/// Cached `numpy.generic` — the base of numpy scalar types (e.g. `np.float64`),
+/// used to tell a numpy-scalar magnitude from a Python scalar / an ndarray.
+fn numpy_generic_cls<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    CLS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("numpy")?.getattr("generic")?.unbind())
+    })
+    .map(|c| c.bind(py).clone())
+}
+
+/// `Some(obj)` if `obj` is a `pint.Quantity`, else `None` (never errors — a
+/// failed pint import just means "not a Quantity").
+fn as_pint_quantity<'a, 'py>(obj: &'a Bound<'py, PyAny>) -> Option<&'a Bound<'py, PyAny>> {
+    let cls = pint_quantity_cls(obj.py()).ok()?;
+    if obj.is_instance(&cls).unwrap_or(false) {
+        Some(obj)
+    } else {
+        None
+    }
+}
+
+/// Lower a `pint.Quantity` to `Value::Tagged(Pint, {..})`, preserving the
+/// magnitude dtype so [`pint_to_py`] can rebuild `np.float64` vs a Python
+/// `float` (the `1/Quantity(0.0)` inf-vs-`ZeroDivisionError` hazard). A numpy
+/// scalar magnitude records a viva-core-private `__viva_scalar_dtype__` key —
+/// `bigraph_json_hook` keys scalars on the *absence* of `__magnitude_dtype__`,
+/// so the private key leaves that decode path (and the scalar vs 0-d-array
+/// distinction) unchanged. An ndarray magnitude uses the upstream
+/// `__magnitude_dtype__` shape.
+fn quantity_to_value(q: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let py = q.py();
+    let mag = q.getattr("magnitude")?;
+    let units = q.getattr("units")?.str()?.to_str()?.to_string();
+    let mut m = Map::new();
+    m.insert("__pint__".to_string(), Value::Bool(true));
+
+    let generic = numpy_generic_cls(py)?;
+    if mag.is_instance(&generic).unwrap_or(false) {
+        // numpy scalar (np.float64, ...): record the private scalar dtype.
+        let dtype = mag.getattr("dtype")?.str()?.to_str()?.to_string();
+        let item = mag.call_method0("item")?;
+        m.insert("magnitude".to_string(), py_to_value(&item)?);
+        m.insert("units".to_string(), Value::Str(units));
+        m.insert("__viva_scalar_dtype__".to_string(), Value::Str(dtype));
+    } else if mag.hasattr("dtype").unwrap_or(false) && mag.hasattr("tolist").unwrap_or(false) {
+        // numpy ndarray magnitude: upstream array shape.
+        let dtype = mag.getattr("dtype")?.str()?.to_str()?.to_string();
+        let lowered = mag.call_method0("tolist")?;
+        m.insert("magnitude".to_string(), py_to_value(&lowered)?);
+        m.insert("units".to_string(), Value::Str(units));
+        m.insert("__magnitude_dtype__".to_string(), Value::Str(dtype));
+    } else {
+        // Python scalar magnitude (float/int): no dtype key -> rebuilds as a
+        // Python scalar.
+        m.insert("magnitude".to_string(), py_to_value(&mag)?);
+        m.insert("units".to_string(), Value::Str(units));
+    }
+    Ok(Value::Tagged(TagKind::Pint, m))
+}
+
+/// Rebuild a `pint.Quantity` from a `Value::Tagged(Pint, {..})`, restoring the
+/// magnitude dtype (numpy scalar / ndarray / Python scalar) recorded by
+/// [`quantity_to_value`] (or the upstream `__magnitude_dtype__` for arrays).
+fn pint_to_py<'py>(py: Python<'py>, m: &Map<Value>) -> PyResult<Bound<'py, PyAny>> {
+    let ureg = quantity_registry(py)?;
+    let units = match m.get("units") {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => return Err(perr("pint tag missing a `units` string")),
+    };
+    let unit_obj = parsed_unit(py, &ureg, units)?;
+    let mag_val = m
+        .get("magnitude")
+        .or_else(|| m.get("value"))
+        .ok_or_else(|| perr("pint tag missing a `magnitude`"))?;
+
+    let np = py.import("numpy")?;
+    let mag_py = if let Some(Value::Str(dt)) = m.get("__magnitude_dtype__") {
+        // array magnitude: np.array(mag, dtype=dt).
+        let lst = value_to_py(py, mag_val)?;
+        np.getattr("array")?
+            .call((lst,), Some(&[("dtype", dt.as_str())].into_py_dict(py)?))?
+    } else if let Some(Value::Str(dt)) = m.get("__viva_scalar_dtype__") {
+        // numpy scalar magnitude: np.dtype(dt).type(mag) -> e.g. np.float64(x).
+        let scalar = value_to_py(py, mag_val)?;
+        np.getattr("dtype")?
+            .call1((dt.as_str(),))?
+            .getattr("type")?
+            .call1((scalar,))?
+    } else {
+        // Python scalar magnitude.
+        value_to_py(py, mag_val)?
+    };
+
+    ureg.getattr("Quantity")?.call1((mag_py, unit_obj))
+}
+
+/// Parse (and cache) a pint unit string -> a registry Unit object. The same
+/// ~23 unit strings recur every tick, so parsing them once removes the per-tick
+/// `parse_units` cost.
+fn parsed_unit<'py>(
+    py: Python<'py>,
+    ureg: &Bound<'py, PyAny>,
+    units: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    static CACHE: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+    let cache = CACHE
+        .get_or_try_init(py, || -> PyResult<Py<PyDict>> {
+            Ok(PyDict::new(py).unbind())
+        })?
+        .bind(py);
+    if let Some(u) = cache.get_item(units)? {
+        return Ok(u);
+    }
+    let unit = ureg.call_method1("parse_units", (units,))?;
+    cache.set_item(units, &unit)?;
+    Ok(unit)
 }
 
 /// Convert an arbitrary Python object (including numpy scalars/arrays) into a
@@ -93,6 +241,13 @@ pub fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
             m.insert(k.str()?.to_str()?.to_string(), py_to_value(&v)?);
         }
         return Ok(Value::Map(m));
+    }
+    // pint.Quantity: lower to a Pint-tagged map BEFORE the numpy `tolist`
+    // fallback. An `np.float64`-magnitude Quantity's `tolist()` returns another
+    // Quantity (the fallback would recurse); a Python-float-magnitude Quantity's
+    // `tolist()` raises (it would then drop to `Null`, losing value + units).
+    if let Some(q) = as_pint_quantity(obj) {
+        return quantity_to_value(q);
     }
     // numpy scalar / ndarray: lower to a Python list/scalar, then recurse.
     if let Ok(tolist) = obj.getattr("tolist") {

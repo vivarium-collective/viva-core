@@ -181,35 +181,32 @@ def test_wholemodel_handoff_blocked_process_store(ctx):
         json.dumps(_serialize(agent["process"]))
 
 
-def test_wholemodel_handoff_blocked_pint_units(ctx):
-    """BLOCKER 2: pint/Unum Quantities in ``listeners``/``environment`` cannot be
-    lowered to the JSON state the Rust codec decodes (no unit type / unit bridge)."""
+def test_wholemodel_handoff_pint_units_resolved(ctx):
+    """BLOCKER 2 — RESOLVED by M5 Task 1 (the pint unit bridge, Option A).
+
+    pint Quantities in ``listeners``/``environment`` now lower to the ``__pint__``
+    tagged JSON the Rust codec decodes (and rebuild as real Quantities on the
+    view / return boundary). Both stores serialize cleanly and the lowered blob
+    carries ``__pint__`` tags — the Quantities were lowered, not dropped. (Was
+    previously asserted to FAIL as the M4 unit blocker; this test now trips if the
+    bridge regresses.)"""
     core, bundle = ctx
     agent = _agent(core, bundle)
-    failed = []
-    # pint/Unum lowering fails with AttributeError (Quantity has no _serialize)
-    # or TypeError (json meets a Quantity); narrow the catch so an unrelated
-    # failure does not masquerade as the unit blocker.
     for store in ("listeners", "environment"):
-        try:
-            json.dumps(_serialize(agent[store]))
-        except (AttributeError, TypeError) as e:
-            failed.append((store, type(e).__name__))
-    assert {s for s, _ in failed} == {"listeners", "environment"}, (
-        f"expected BOTH pint-carrying stores to fail unit lowering, got {failed}"
-    )
+        blob = json.dumps(_serialize(agent[store]))  # no longer raises
+        assert '"__pint__"' in blob, f"{store}: expected lowered pint tags, got none"
 
 
 def test_wholemodel_full_agent_not_serializable(ctx):
-    """The whole baseline agent cannot currently be handed to run_prebuilt as one
-    payload — the honest M4 whole-model gate. It refuses for one of three recorded
-    reasons: the as-built agent isn't fully pre-realized (not every edge carries a
-    live ``instance``, e.g. ``shape_step`` -> ValueError); the live process-as-data
-    store can't JSON-serialize (TypeError); or a pint ``Quantity`` in
-    listeners/environment can't lower (AttributeError). Removing this failure
-    requires pre-realizing the agent AND the unit bridge + live-store-object
-    passing noted in docs/milestone-4-results.md (M5)."""
+    """The whole baseline agent still cannot be handed to run_prebuilt as one
+    payload — the honest whole-model gate. With M5 Task 1 the pint-unit blocker is
+    gone, so it now refuses for one of the two STRUCTURAL reasons that remain: the
+    as-built agent isn't fully pre-realized (not every edge carries a live
+    ``instance``, e.g. ``shape_step`` -> ValueError), or the live process-as-data
+    store can't JSON-serialize (TypeError). Removing this failure needs
+    pre-realizing the agent AND the live-store-object passing (M5 Tasks 2-3), per
+    docs/milestone-4-results.md."""
     core, bundle = ctx
     agent = _agent(core, bundle)
-    with pytest.raises((ValueError, TypeError, AttributeError)):
+    with pytest.raises((ValueError, TypeError)):
         prebuilt.build_payload(agent)

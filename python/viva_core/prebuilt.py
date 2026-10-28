@@ -24,8 +24,32 @@ Given a realized composite state dict (``{store_or_edge_name: value}``) it:
 import json
 
 import numpy as np
+import pint
 
 import viva_core
+
+
+def _serialize_quantity(q):
+    """A ``pint.Quantity`` -> the ``__pint__`` tagged dict the Rust codec decodes.
+
+    Mirrors ``convert.rs::quantity_to_value`` so a Quantity in the initial state
+    and a Quantity written by a process lower to the SAME shape: a numpy-scalar
+    magnitude records the viva-core-private ``__viva_scalar_dtype__`` key (so the
+    ``np.float64`` vs ``float`` distinction survives the round-trip — the
+    ``1/Quantity(0.0)`` inf-vs-ZeroDivisionError hazard), while an ndarray
+    magnitude uses the upstream ``__magnitude_dtype__``. The private key is
+    ignored by ``bigraph_json_hook`` (which keys scalars on the *absence* of
+    ``__magnitude_dtype__``).
+    """
+    mag = q.magnitude
+    units = str(q.units)
+    if isinstance(mag, np.ndarray):
+        return {"__pint__": True, "magnitude": mag.tolist(),
+                "__magnitude_dtype__": str(mag.dtype), "units": units}
+    if isinstance(mag, np.generic):
+        return {"__pint__": True, "magnitude": mag.item(),
+                "units": units, "__viva_scalar_dtype__": str(mag.dtype)}
+    return {"__pint__": True, "magnitude": mag, "units": units}
 
 
 def _is_edge(v):
@@ -59,6 +83,8 @@ def _serialize(value):
     ``unique_index``) become ``__structured_array__`` dicts; plain arrays/scalars
     lower via ``tolist``/``item``; dicts/lists recurse.
     """
+    if isinstance(value, pint.Quantity):  # must precede the `tolist` branch
+        return _serialize_quantity(value)
     names = getattr(getattr(value, "dtype", None), "names", None)
     if names:  # structured array (ndarray or v2ecoli MetadataArray)
         return {

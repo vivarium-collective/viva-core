@@ -522,3 +522,101 @@ class UniqueReallocProbe(EcoliProcess):
             "snap_active_sum": snap["active_sum"],
         })
         return {}
+
+
+# --------------------------------------------------------------------------- #
+# M5 unit bridge: a process that WRITES pint Quantities (exercising the
+# py_to_value Quantity arm via overwrite ops) and READS them back across ticks
+# (exercising the value_to_py Pint arm on an input view) — the write->read
+# round-trip that the `effective_elongation_rate` strict read depends on.
+# --------------------------------------------------------------------------- #
+
+# Per-tick record of what QuantityCycler READ from its (previously-written)
+# quantity stores: type, is-Quantity, magnitude dtype, and whether the strict
+# `.to(<unit>)` read succeeded. Cleared by the test before each run.
+QUANTITY_READ_LOG: list = []
+
+
+class QuantityCycler(EcoliProcess):
+    """Fixed-timestep process that each tick READS four quantity stores (as an
+    input view) and WRITES fresh pint Quantities back to the SAME stores.
+
+    * The writes are ``pint.Quantity`` values returned on ``overwrite[...]``
+      ports -> the Rust ``op_from_type`` routes each to ``Op::Overwrite`` and
+      calls ``py_to_value`` on the Quantity (the arm that, pre-M5, either
+      infinite-recursed on an ``np.float64`` magnitude or dropped a Python-float
+      magnitude to ``Null``).
+    * Because inputs and outputs wire to the same stores, on tick ``t+1`` the
+      input view is exactly what was written on tick ``t`` -> each read goes
+      through ``value_to_py`` on a ``Value::Tagged(Pint, ..)`` leaf. This is the
+      write->read-across-ticks path the strict ``effective_elongation_rate`` read
+      (PolypeptideElongation -> PolypeptideInitiation) relies on.
+
+    Magnitudes are fixed np.float64 values (plus one Python-float store) so the
+    final state is deterministic and the ``np.float64`` vs ``float`` distinction
+    is observable. The ``zero_mass`` store is zero so ``1 / q`` must give ``inf``
+    (np.float64) rather than raising ``ZeroDivisionError`` (Python float).
+
+    Output schema units: ``femtogram`` is a bare symbol and parses as
+    ``quantity[float,femtogram]``; the non-bare units (``1 / second``,
+    ``amino_acid / second``) are declared ``overwrite[float]`` since the Rust
+    ``op_from_type`` ignores an Overwrite's inner type — the real unit travels on
+    the Quantity value, not the schema.
+    """
+
+    name = "quantity_cycler"
+    config_schema = {}
+
+    # port -> the unit string the written Quantity carries (and the unit the
+    # strict read converts to via `.to(...)`).
+    UNITS = {
+        "mass": "femtogram",
+        "rate": "1 / second",
+        "eff_rate": "amino_acid / second",
+        "zero_mass": "femtogram",
+        "py_mass": "femtogram",
+    }
+
+    def inputs(self):
+        return {port: "float" for port in self.UNITS}
+
+    def outputs(self):
+        return {
+            "mass": "overwrite[quantity[float,femtogram]]",
+            "zero_mass": "overwrite[quantity[float,femtogram]]",
+            "py_mass": "overwrite[quantity[float,femtogram]]",
+            "rate": "overwrite[float]",
+            "eff_rate": "overwrite[float]",
+        }
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        import pint
+        from bigraph_schema.units import get_quantity_registry
+
+        ureg = get_quantity_registry()
+        rec = {}
+        for port, unit in self.UNITS.items():
+            v = state.get(port)
+            info = {"type": type(v).__name__,
+                    "is_quantity": isinstance(v, pint.Quantity)}
+            if info["is_quantity"]:
+                info["mag_dtype"] = type(v.magnitude).__name__
+                try:
+                    info["mag"] = float(v.to(unit).magnitude)  # the strict read
+                    info["to_ok"] = True
+                except Exception as exc:  # noqa: BLE001
+                    info["to_ok"] = False
+                    info["err"] = repr(exc)
+            rec[port] = info
+        QUANTITY_READ_LOG.append(rec)
+
+        return {
+            "mass": ureg.Quantity(np.float64(5.0), "femtogram"),
+            "rate": ureg.Quantity(np.float64(2.0), "1 / second"),
+            "eff_rate": ureg.Quantity(np.float64(1.2345), "amino_acid / second"),
+            "zero_mass": ureg.Quantity(np.float64(0.0), "femtogram"),
+            "py_mass": ureg.Quantity(3.0, "femtogram"),  # Python-float magnitude
+        }
