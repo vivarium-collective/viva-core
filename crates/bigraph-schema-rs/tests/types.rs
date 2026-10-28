@@ -84,6 +84,18 @@ fn parse_and_resolve_fixture_types() {
             units: Some("fg".into())
         }
     );
+    // Bare `bulk_array` / `unique_array` (no field list) — the form a v2ecoli
+    // process `outputs()` declares for a molecule port — must parse to the
+    // structured types (not fall through to Named), so updates route to the
+    // additive bulk / path-keyed unique ops rather than Overwrite.
+    assert_eq!(
+        parse_type("bulk_array").unwrap(),
+        Type::BulkArray { fields: vec![] }
+    );
+    assert_eq!(
+        parse_type("unique_array").unwrap(),
+        Type::UniqueArray { fields: vec![] }
+    );
 }
 
 fn find_bulk(m: &bigraph_schema_rs::doc::Map<Node>) -> Option<&bigraph_schema_rs::doc::Map<Value>> {

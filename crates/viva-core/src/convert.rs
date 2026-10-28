@@ -382,8 +382,12 @@ fn is_unique_update(value: &Bound<'_, PyAny>) -> PyResult<bool> {
     Ok(false)
 }
 
-/// Parse a v2ecoli `BulkNumpyUpdate` (a list of `(index, delta)` pairs, or a
-/// numpy array of such) into [`Op::BulkDelta`].
+/// Parse a v2ecoli `BulkNumpyUpdate` into [`Op::BulkDelta`]. The update is a
+/// list of `(index, delta)` pairs; faithful to `bulk_numpy_updater`
+/// (`state["count"][idx] += value`), **each element of a pair may be a scalar
+/// OR a numpy array** — the real v2ecoli hot path returns one vectorized pair
+/// `(np.array(indices), np.array(deltas))`. Array/array pairs are zipped
+/// element-wise; a scalar broadcasts against the array side.
 fn bulk_op(value: &Bound<'_, PyAny>) -> PyResult<Op> {
     let mut deltas: Vec<(usize, i128)> = Vec::new();
     let v = py_to_value(value)?;
@@ -391,14 +395,38 @@ fn bulk_op(value: &Bound<'_, PyAny>) -> PyResult<Op> {
         for pair in pairs {
             if let Value::Array(p) = pair {
                 if p.len() >= 2 {
-                    let idx = as_i128(&p[0]) as usize;
-                    let delta = as_i128(&p[1]);
-                    deltas.push((idx, delta));
+                    push_bulk_pair(&p[0], &p[1], &mut deltas);
                 }
             }
         }
     }
     Ok(Op::BulkDelta(deltas))
+}
+
+/// Expand one `(index, delta)` pair into flat `(usize, i128)` deltas, matching
+/// numpy's `count[idx] += value` broadcasting for scalar/array operands.
+fn push_bulk_pair(idx: &Value, delta: &Value, out: &mut Vec<(usize, i128)>) {
+    let to_idx = |v: &Value| as_i128(v).max(0) as usize;
+    match (idx, delta) {
+        (Value::Array(ix), Value::Array(dv)) => {
+            for (i, d) in ix.iter().zip(dv.iter()) {
+                out.push((to_idx(i), as_i128(d)));
+            }
+        }
+        (Value::Array(ix), d) => {
+            let dd = as_i128(d);
+            for i in ix {
+                out.push((to_idx(i), dd));
+            }
+        }
+        (i, Value::Array(dv)) => {
+            let ii = to_idx(i);
+            for d in dv {
+                out.push((ii, as_i128(d)));
+            }
+        }
+        (i, d) => out.push((to_idx(i), as_i128(d))),
+    }
 }
 
 fn as_i128(v: &Value) -> i128 {

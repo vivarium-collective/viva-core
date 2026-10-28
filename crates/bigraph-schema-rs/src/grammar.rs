@@ -242,6 +242,12 @@ impl Parser<'_> {
                     elem: Box::new(elem),
                 }
             }
+            // Bare `bulk_array` / `unique_array` (no field list) is the form a
+            // v2ecoli process `outputs()` declares for a molecule port (the
+            // concrete fields live on the store, not the port type). It must
+            // still route updates to the additive bulk / path-keyed unique ops.
+            ("bulk_array", 0) => Type::BulkArray { fields: Vec::new() },
+            ("unique_array", 0) => Type::UniqueArray { fields: Vec::new() },
             ("bulk_array", 1) => match self.param_type(params.remove(0)) {
                 Type::Record(fields) => Type::BulkArray { fields },
                 _ => return Err(self.err("bulk_array parameter must be fields")),

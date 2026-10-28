@@ -35,11 +35,11 @@
 **Interfaces:**
 - Produces: `doc::CompositeSpec` (stores tree + `Vec<ProcessEdge>{address, config, inputs, outputs, interval, _contract}`), `doc::Value` (the tagged-union over number/int/array/tagged-dict), `codec::from_json(&str) -> CompositeSpec`, `codec::to_json(&CompositeSpec) -> String` with lenient NaN/Infinity.
 
-- [ ] Step 1: Write failing test `roundtrip_structural`: load the real `.pbg` fixture, `from_json` then `to_json`, assert structural equivalence (same store tree, same edges/wiring/config), and that bare `Infinity`/`NaN` parse (don't error).
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement the data model + lenient codec (serde with a custom de/serializer accepting non-finite floats; tagged-dict handling for pint/numpy/set/bytes as opaque-preserving `Value` variants for now).
-- [ ] Step 4: Run → PASS.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing test `roundtrip_structural`: load the real `.pbg` fixture, `from_json` then `to_json`, assert structural equivalence (same store tree, same edges/wiring/config), and that bare `Infinity`/`NaN` parse (don't error).
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement the data model + lenient codec (serde with a custom de/serializer accepting non-finite floats; tagged-dict handling for pint/numpy/set/bytes as opaque-preserving `Value` variants for now).
+- [x] Step 4: Run → PASS.
+- [x] Step 5: Commit.
 
 ---
 
@@ -49,11 +49,11 @@
 
 **Interfaces:** Consumes Task 1's `Value`. Produces: `types::Type` (primitives + `array[dtype]` + tree/map + the structured unique-record type), `grammar::parse_type(&str) -> Type` (the bigraph-notation PEG, subset), `registry::Registry` (name → Type + apply/reconcile dispatch keys). **Decision:** enumerate the types used by the fixture's store schemas; implement exactly those.
 
-- [ ] Step 1: Write failing test `parse_and_resolve_fixture_types`: for each store schema string in the fixture, `parse_type` round-trips the notation and the registry resolves it to a concrete `Type` (including the unique structured-record type).
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement the grammar subset + registry.
-- [ ] Step 4: Run → PASS.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing test `parse_and_resolve_fixture_types`: for each store schema string in the fixture, `parse_type` round-trips the notation and the registry resolves it to a concrete `Type` (including the unique structured-record type).
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement the grammar subset + registry.
+- [x] Step 4: Run → PASS.
+- [x] Step 5: Commit.
 
 ---
 
@@ -63,11 +63,11 @@
 
 **Interfaces:** Consumes Tasks 1–2. Produces: `state::State` (bulk → `ndarray` flat arrays; unique → structured record arrays; nested per the store tree), `state::from_initial(&CompositeSpec, initial_json) -> State`, `apply::apply_update(&mut State, &[Update])` and `apply::reconcile(...)` implementing the SUBSET of ops the model uses (accumulate-then-apply; the reconcile/bulk semantics). **Review-focus:** i64/bigint audit here; unique-store set/add/delete semantics.
 
-- [ ] Step 1: Write failing tests: `apply_bulk_matches_python` (apply a fixed update set to a bulk store, compare decoded state to the Python `apply` output on the same inputs — int-exact) and `apply_unique_set_add_delete` (unique store ops) and `no_i64_overflow_on_large_counts`.
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement state + apply/reconcile for the subset ops (i128/checked where counts can overflow).
-- [ ] Step 4: Run → PASS.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing tests: `apply_bulk_matches_python` (apply a fixed update set to a bulk store, compare decoded state to the Python `apply` output on the same inputs — int-exact) and `apply_unique_set_add_delete` (unique store ops) and `no_i64_overflow_on_large_counts`.
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement state + apply/reconcile for the subset ops (i128/checked where counts can overflow).
+- [x] Step 4: Run → PASS.
+- [x] Step 5: Commit.
 
 ---
 
@@ -77,11 +77,11 @@
 
 **Interfaces:** Consumes bigraph-schema-rs. Produces: `schedule::wire_step_layers(&CompositeSpec) -> Vec<Layer>` (dependency-ordered edges, mirroring pb 1.8.3's layering incl. the layer-0 `_triggers`={global_time} rule), `engine::Engine{state, layers}` with `engine.run(n_ticks)` (each tick: per layer, run each process → accumulate triples → apply/reconcile; advance global_time clock), a `Process` trait (`inputs()/outputs()/update(state) -> updates`), and a RAM/JSON emitter step. **Decision:** M1 runs with a stub/native test `Process` here; the Python-process path is Task 5.
 
-- [ ] Step 1: Write failing tests: `layer_order_matches_pb` (a small spec's layers match pb 1.8.3's order), `run_advances_clock_and_applies`, `emitter_captures_each_tick`.
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement scheduler + tick loop + emitter.
-- [ ] Step 4: Run → PASS.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing tests: `layer_order_matches_pb` (a small spec's layers match pb 1.8.3's order), `run_advances_clock_and_applies`, `emitter_captures_each_tick`.
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement scheduler + tick loop + emitter.
+- [x] Step 4: Run → PASS.
+- [x] Step 5: Commit.
 
 ---
 
@@ -91,11 +91,11 @@
 
 **Interfaces:** Consumes Task 4. Produces a Python module `viva_core` with `run(pbg_path|spec_json, n_ticks) -> state`, where for each process edge the engine resolves its `local:<Name>` address, imports the Python class, and each tick calls its `update(state)` with **zero-copy numpy views** of the input stores (bulk AND unique structured), then applies the returned deltas via Task 3. `maturin develop` into `.venv-m1`.
 
-- [ ] Step 1: Write failing `@parity` test `test_quadrant3_bit_identical`: run a REAL (start small — a few-process) v2ecoli `.pbg` for N ticks under (a) the Python pb 1.8.3 engine and (b) `viva_core.run`; assert decoded state bit-identical (int-exact, float-epsilon). Include a case where a Python process reads/writes a UNIQUE store through the boundary.
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement the PyO3 bridge (address resolution, zero-copy numpy views, per-tick callback, apply).
-- [ ] Step 4: Run → PASS. Scale the fixture up toward the full `partitioned.pbg` as far as it holds; record where it breaks if it does.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing `@parity` test `test_quadrant3_bit_identical`: run a REAL (start small — a few-process) v2ecoli `.pbg` for N ticks under (a) the Python pb 1.8.3 engine and (b) `viva_core.run`; assert decoded state bit-identical (int-exact, float-epsilon). Include a case where a Python process reads/writes a UNIQUE store through the boundary.
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement the PyO3 bridge (address resolution, zero-copy numpy views, per-tick callback, apply).
+- [x] Step 4: Run → PASS. Scale the fixture up toward the full `partitioned.pbg` as far as it holds; record where it breaks if it does.
+- [x] Step 5: Commit.
 
 ---
 
@@ -105,11 +105,11 @@
 
 **Interfaces:** A Rust process exposed via PyO3 with `inputs()/outputs()/update(state[,interval])`, wrapped in the ~10-line Python `Process` shell so pb's registry can address it by `local:<Name>`. Consumes nothing from Tasks 4–5 beyond the shared types.
 
-- [ ] Step 1: Write failing test `test_quadrant4_bit_identical`: build a tiny composite whose step layer references the Rust-backed process by address, run it under the REAL `process_bigraph.Composite` (1.8.3), assert bit-identical to a pure-Python twin process on the same inputs.
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement the `#[pyclass]` process + the Python shell + registration.
-- [ ] Step 4: Run → PASS.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing test `test_quadrant4_bit_identical`: build a tiny composite whose step layer references the Rust-backed process by address, run it under the REAL `process_bigraph.Composite` (1.8.3), assert bit-identical to a pure-Python twin process on the same inputs.
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement the `#[pyclass]` process + the Python shell + registration.
+- [x] Step 4: Run → PASS.
+- [x] Step 5: Commit.
 
 ---
 
@@ -119,11 +119,11 @@
 
 **Interfaces:** `parallel::run_ensemble(specs_or_seeds, n_ticks) -> Vec<State>` using `rayon`. A standalone `mpi_smoke` binary (links Homebrew Open MPI 5) that scatters seeds across ranks, runs the engine per rank, gathers a scalar; run via `mpirun -n 2`.
 
-- [ ] Step 1: Write failing tests: `ensemble_bit_identical_to_serial` (rayon ensemble of the real composite == running each serially) and a smoke assertion that `mpirun -n 2 mpi_smoke` prints the gathered result.
-- [ ] Step 2: Run → FAIL.
-- [ ] Step 3: Implement rayon ensemble + rsmpi smoke binary.
-- [ ] Step 4: Run → PASS.
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing tests: `ensemble_bit_identical_to_serial` (rayon ensemble of the real composite == running each serially) and a smoke assertion that `mpirun -n 2 mpi_smoke` prints the gathered result.
+- [x] Step 2: Run → FAIL.
+- [x] Step 3: Implement rayon ensemble + rsmpi smoke binary.
+- [x] Step 4: Run → PASS.
+- [x] Step 5: Commit.
 
 ---
 
@@ -131,13 +131,13 @@
 
 **Files:** `python/viva_core/conformance.py` + `python/benchmarks/bench_m1.py`; Test `python/tests/test_conformance_suite.py`.
 
-**Interfaces:** A cross-language conformance runner (reuse the v2ecoli `distilled_compare.py` methodology) that runs the chosen real `.pbg` under both engines and reports per-store/per-observable divergence; and a benchmark reporting the **honest day-one number**: Rust engine + Python processes vs Python engine + Python processes, same `.pbg`, warm-up excluded, ticks/sec + ratio.
+**Interfaces:** A cross-language conformance runner (reuse the v2ecoli `distilled_compare.py` methodology) that runs the chosen real `.pbg` under both engines and reports per-store/per-observable divergence; a benchmark reporting the **honest day-one number** (Rust engine + Python processes vs Python engine + Python processes, same `.pbg`, warm-up excluded, ticks/sec + ratio); AND an **upstream-suite conformance layer** (see ruling below): run the real `bigraph-schema` 1.6.0 test suite (and the `run()`-level subset of the `process-bigraph` 1.8.3 suite) against the Rust engine via a drop-in shim (`import viva_core as process_bigraph` / schema equivalents), reporting the **passing-fraction** and a triaged skip-list of implementation-coupled tests (exact Python exception types, object identity, internal attrs). This passing-fraction is the north-star conformance metric that grows as ops/types/processes are ported.
 
-- [ ] Step 1: Write failing test `test_conformance_full_model`: the largest `.pbg` that Task 5 reached runs bit-identical under both engines across N ticks (int-exact, float-epsilon).
-- [ ] Step 2: Run → FAIL (or surface the real divergence honestly).
-- [ ] Step 3: Implement the conformance runner + benchmark.
-- [ ] Step 4: Run → PASS; record the measured day-one ticks/sec + ratio in `docs/` (honest — this is the number the design promised to produce).
-- [ ] Step 5: Commit.
+- [x] Step 1: Write failing test `test_conformance_full_model`: the largest `.pbg` that Task 5 reached runs bit-identical under both engines across N ticks (int-exact, float-epsilon).
+- [x] Step 2: Run → FAIL (or surface the real divergence honestly).
+- [x] Step 3: Implement the conformance runner + benchmark + the upstream-suite shim runner. For the upstream suites, run them against the Rust engine, categorize each failure as (a) unimplemented-subset (expected in M1 — the engine doesn't cover that op/type yet), (b) implementation-coupled (triage to skip-list with reason), or (c) a REAL contract divergence (a conformance bug). Report counts for each.
+- [x] Step 4: Run → PASS the model parity; record the day-one ticks/sec + ratio AND the upstream-suite passing-fraction + the (a)/(b)/(c) breakdown in `docs/` (honest).
+- [x] Step 5: Commit.
 
 ---
 
