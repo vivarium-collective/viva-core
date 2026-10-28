@@ -148,7 +148,11 @@ pub fn storenode_to_py<'py>(
         StoreNode::Bulk(b) => {
             if structured {
                 // M2 zero-copy: a read-only view over `BulkStore.count`.
-                bulk_count_view(py, &b.count)?
+                let view = bulk_count_view(py, &b.count)?;
+                let ids = cached_bulk_ids(py, &b.ids)?;
+                py.import("viva_core._bulkview")?
+                    .getattr("wrap")?
+                    .call1((view, ids))?
             } else {
                 let d = PyDict::new(py);
                 d.set_item("id", &b.ids)?;
@@ -179,6 +183,35 @@ pub fn storenode_to_py<'py>(
             }
         }
     })
+}
+
+/// numpy `id` array for a bulk store, built once per distinct id list. Keyed by
+/// the Vec's address and validated by full equality on every hit (so a recycled
+/// address from a different engine can never serve stale ids).
+fn cached_bulk_ids<'py>(py: Python<'py>, ids: &[String]) -> PyResult<Bound<'py, PyAny>> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    type IdCache = Mutex<Option<HashMap<usize, (Vec<String>, Py<PyAny>)>>>;
+    static CACHE: IdCache = Mutex::new(None);
+    let key = ids.as_ptr() as usize;
+    {
+        let guard = CACHE.lock().unwrap();
+        if let Some((cached, arr)) = guard.as_ref().and_then(|m| m.get(&key)) {
+            if cached.as_slice() == ids {
+                return Ok(arr.bind(py).clone());
+            }
+        }
+    }
+    let arr = py
+        .import("viva_core._bulkview")?
+        .getattr("make_ids")?
+        .call1((PyList::new(py, ids)?,))?;
+    CACHE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(key, (ids.to_vec(), arr.clone().unbind()));
+    Ok(arr)
 }
 
 /// Cached numpy dtype `[("count", "<i8")]` (built once, not per tick).

@@ -29,6 +29,7 @@ use process_bigraph_rs::process::Process;
 use process_bigraph_rs::registry::ProcessRegistry;
 
 mod convert;
+mod processes;
 mod pyproc;
 mod rust_process;
 
@@ -136,6 +137,12 @@ fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
         }
     }
     for address in addresses {
+        // Native (all-Rust) twin, when enabled by VIVA_NATIVE_PROCESSES: same
+        // address, registered INSTEAD of the PyProcess fallback.
+        if let Some(ctor) = processes::native_ctor(&address) {
+            registry.register(&address, ctor);
+            continue;
+        }
         let addr = address.clone();
         let dmap = Arc::clone(&dtypes);
         registry.register(&address, move |cfg| {
