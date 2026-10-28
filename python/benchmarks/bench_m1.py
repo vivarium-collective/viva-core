@@ -154,7 +154,7 @@ def run(n_ticks: int = 2000, n_bulk: int = 200, n_unique: int = 2000,
 
 def main() -> None:
     r = run()
-    print("=== viva-core Milestone 1 - day-one benchmark (HONEST) ===")
+    print("=== viva-core Milestone 1/2 - day-one benchmark (HONEST) ===")
     print(f"{r['n_ticks']} ticks, best-of-{r['repeats']}, warm-up excluded")
     print()
     print("A. Structured-array composite (1 Python bulk-evolver, "
@@ -176,8 +176,9 @@ def main() -> None:
     print(f"     Python engine + Python procs : {r['scalar']['pb_tps']:>12.1f} ticks/s")
     print(f"     ratio (Rust / Py)            : {r['scalar']['ratio']:>12.3f}x")
     print()
-    print("  Zero-copy for structured arrays is NOT done; A is dominated by that")
-    print("  copy and is the pessimistic bound. The full-native ceiling (Rust")
+    print("  Bulk + unique read views are zero-copy as of M2. Ratios depend on the")
+    print("  build: use `maturin develop --release` (debug is ~10x slower). The")
+    print("  full-native ceiling (Rust")
     print("  engine + Rust processes) is NOT measurable via the M1 run() surface.")
     print("  See docs/milestone-1-results.md.")
 
