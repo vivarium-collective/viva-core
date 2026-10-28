@@ -202,3 +202,49 @@ class FloatAccumulator(EcoliStep):
 
     def update(self, state, interval=None):
         return {"value": float(self.parameters.get("rate", 1.0))}
+
+
+# Module-level capture for the zero-copy test: every tick the process records
+# facts about the `bulk` view it was handed (it runs in-process under both
+# engines, so the test can read this list afterwards).
+VIEW_LOG: list = []
+
+
+class ViewProbeProcess(EcoliProcess):
+    """Records, each tick, whether the bulk view it receives is the SAME memory
+    as the previous tick's view (zero-copy) and whether it is read-only. Also
+    checks the previous view still reflects the live store (a genuine view, not
+    a snapshot). Writes the same delta as :class:`BenchBulkProcess`."""
+
+    name = "view_probe_process"
+    config_schema = {}
+    _prev = None
+
+    def inputs(self):
+        return {"bulk": "bulk_array"}
+
+    def outputs(self):
+        return {"bulk": "bulk_array"}
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        view = state["bulk"]
+        counts = np.asarray(view["count"])
+        rec = {
+            "names": view.dtype.names,
+            "writeable": bool(view.flags.writeable),
+            "counts": counts.copy(),
+        }
+        if ViewProbeProcess._prev is not None:
+            prev = ViewProbeProcess._prev
+            rec["shares_prev"] = bool(np.shares_memory(prev, view))
+            rec["prev_live"] = bool(np.array_equal(prev["count"], counts))
+        else:
+            rec["shares_prev"] = None
+            rec["prev_live"] = None
+        ViewProbeProcess._prev = view
+        VIEW_LOG.append(rec)
+        idx = np.arange(counts.shape[0], dtype=np.int64)
+        return {"bulk": [(idx, ((counts % 7) - 3).astype(np.int64))]}

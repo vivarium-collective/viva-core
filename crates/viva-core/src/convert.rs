@@ -2,7 +2,11 @@
 //! numpy structured-array view building, and update-dict -> typed [`Op`]
 //! translation.
 
+use ndarray::Array1;
+use numpy::PyArray1;
 use pyo3::prelude::*;
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{IntoPyDict, PyCapsule};
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 use bigraph_schema_rs::apply::{Op, UniqueOp};
@@ -139,20 +143,8 @@ pub fn storenode_to_py<'py>(
         }
         StoreNode::Bulk(b) => {
             if structured {
-                let mut cols: Vec<(String, &Column)> = Vec::new();
-                let count = Column::Int(b.count.clone());
-                let ids = Column::Str(b.ids.clone());
-                cols.push(("id".into(), &ids));
-                cols.push(("count".into(), &count));
-                let float_cols: Vec<(String, Column)> = b
-                    .floats
-                    .iter()
-                    .map(|(k, a)| (k.clone(), Column::Float(a.clone())))
-                    .collect();
-                for (k, c) in &float_cols {
-                    cols.push((k.clone(), c));
-                }
-                build_structured_array(py, &cols, dtypes.get(path))?
+                // M2 zero-copy: a read-only view over `BulkStore.count`.
+                bulk_count_view(py, &b.count)?
             } else {
                 let d = PyDict::new(py);
                 d.set_item("id", &b.ids)?;
@@ -178,6 +170,45 @@ pub fn storenode_to_py<'py>(
             }
         }
     })
+}
+
+/// Cached numpy dtype `[("count", "<i8")]` (built once, not per tick).
+fn count_dtype<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static DT: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    DT.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        let descr = PyList::new(py, [PyTuple::new(py, ["count", "<i8"])?])?;
+        Ok(py
+            .import("numpy")?
+            .getattr("dtype")?
+            .call1((descr,))?
+            .unbind())
+    })
+    .map(|d| d.bind(py).clone())
+}
+
+/// Zero-copy, READ-ONLY numpy structured-array view (`[("count","<i8")]`) over
+/// the Rust-owned `BulkStore.count` buffer. No allocation or copy: the array's
+/// data pointer is the `Array1<i64>`'s own storage.
+///
+/// Ownership/lifetime: Rust owns the buffer; the view is handed out for the
+/// duration of one process call. The buffer is only ever written in place by
+/// `Op::BulkDelta` (never reallocated mid-run) and only after the process has
+/// returned, so a view used inside the call can never dangle. The view is
+/// `writeable=False`: a process cannot mutate Rust state through it (writes go
+/// back as update dicts -> `Op::BulkDelta`). A process must not retain the view
+/// past the run (v2ecoli processes return updates; they do not stash views).
+fn bulk_count_view<'py>(py: Python<'py>, count: &Array1<i64>) -> PyResult<Bound<'py, PyAny>> {
+    if count.as_slice().is_none() {
+        // Non-contiguous (never produced by M1 loaders): fall back to a copy.
+        let owned = PyArray1::from_vec(py, count.to_vec());
+        return owned.call_method1("view", (count_dtype(py)?,));
+    }
+    let pin = PyCapsule::new_with_value(py, (), c"viva_core.bulk_pin")?;
+    // SAFETY: `count` is contiguous and outlives this call (see doc above); the
+    // array is made read-only before it is exposed.
+    let base = unsafe { PyArray1::borrow_from_array(count, pin.into_any()) };
+    base.call_method("setflags", (), Some(&[("write", false)].into_py_dict(py)?))?;
+    base.call_method1("view", (count_dtype(py)?,))
 }
 
 fn column_to_py<'py>(py: Python<'py>, c: &Column) -> PyResult<Bound<'py, PyAny>> {
