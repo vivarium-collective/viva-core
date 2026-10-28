@@ -1,0 +1,13 @@
+[package]
+name = "bigraph-schema-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust data model and lenient JSON codec for the bigraph-schema composite-spec contract"
+
+[dependencies]
+indexmap = "2"
+thiserror = "1"
+
+[dev-dependencies]
+serde_json = "1"
