@@ -34,8 +34,8 @@ PartitionedProcesses' `Requester`/`Evolver` steps read those instances from stat
 each tick (6 edges). Live Python objects cannot round-trip through the JSON state
 codec. (`test_wholemodel_handoff_blocked_process_store`.)
 
-**Blocker 2 — pint/Unum units in stores.** `listeners` (touched by ~28 of 46
-edges) and `environment` (~11) hold pint `Quantity` values. The Rust codec has no
+**Blocker 2 — pint/Unum units in stores.** `listeners` (touched by 29 of 46
+edges) and `environment` (11) hold pint `Quantity` values. The Rust codec has no
 unit type, and the view/update boundary can't re-wrap a bare float as a unit-
 carrying `Quantity` for the Python processes that consume it. So nearly the whole
 model — not a few processes — is gated on a **unit bridge**.

@@ -17,7 +17,7 @@ What does NOT yet run (recorded precisely, not faked):
       (1) the partition "process-as-data" store holds LIVE process instances
           (the 3 PartitionedProcesses' Requester/Evolver read them from state) —
           live Python objects can't round-trip through the JSON state codec;
-      (2) pint/Unum ``Quantity`` values live in the ``listeners`` (~28/46 edges
+      (2) pint/Unum ``Quantity`` values live in the ``listeners`` (29/46 edges
           touch it) and ``environment`` (~11/46) stores — the Rust codec has no
           unit type and the view/update boundary can't re-wrap units.
     These are the M4 forward unknowns; they gate the whole-model engine number.
@@ -187,19 +187,29 @@ def test_wholemodel_handoff_blocked_pint_units(ctx):
     core, bundle = ctx
     agent = _agent(core, bundle)
     failed = []
+    # pint/Unum lowering fails with AttributeError (Quantity has no _serialize)
+    # or TypeError (json meets a Quantity); narrow the catch so an unrelated
+    # failure does not masquerade as the unit blocker.
     for store in ("listeners", "environment"):
         try:
             json.dumps(_serialize(agent[store]))
-        except Exception as e:  # noqa: BLE001 — recording the real failure
+        except (AttributeError, TypeError) as e:
             failed.append((store, type(e).__name__))
-    assert failed, "expected pint-carrying stores to fail JSON serialization"
+    assert {s for s, _ in failed} == {"listeners", "environment"}, (
+        f"expected BOTH pint-carrying stores to fail unit lowering, got {failed}"
+    )
 
 
 def test_wholemodel_full_agent_not_serializable(ctx):
-    """The whole agent therefore cannot currently be handed over as one payload —
-    the honest M4 whole-model gate. (Removing this failure requires the unit
-    bridge + live-store-object passing noted in docs/milestone-4-results.md.)"""
+    """The whole baseline agent cannot currently be handed to run_prebuilt as one
+    payload — the honest M4 whole-model gate. It refuses for one of three recorded
+    reasons: the as-built agent isn't fully pre-realized (not every edge carries a
+    live ``instance``, e.g. ``shape_step`` -> ValueError); the live process-as-data
+    store can't JSON-serialize (TypeError); or a pint ``Quantity`` in
+    listeners/environment can't lower (AttributeError). Removing this failure
+    requires pre-realizing the agent AND the unit bridge + live-store-object
+    passing noted in docs/milestone-4-results.md (M5)."""
     core, bundle = ctx
     agent = _agent(core, bundle)
-    with pytest.raises(Exception):
+    with pytest.raises((ValueError, TypeError, AttributeError)):
         prebuilt.build_payload(agent)
