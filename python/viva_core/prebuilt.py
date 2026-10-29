@@ -121,18 +121,6 @@ def _is_emitter(address):
     )
 
 
-def _strip_layer_ports(wires):
-    """Drop the ``_layer_in_*`` / ``_layer_out_*`` scheduler tokens pb injects
-    into realized edge wiring (the Rust engine computes step layers itself)."""
-    if isinstance(wires, dict):
-        return {
-            k: _strip_layer_ports(v)
-            for k, v in wires.items()
-            if not str(k).startswith("_layer")
-        }
-    return wires
-
-
 def _serialize(value, numpy_tag=True):
     """A store value -> the tagged JSON the Rust codec decodes.
 
@@ -246,9 +234,34 @@ def build_payload(state, native_addresses=None, path=()):
         node = {
             "_type": edge.get("_type", "step"),
             "address": address,
-            "inputs": _strip_layer_ports(edge.get("inputs", {})),
-            "outputs": _strip_layer_ports(edge.get("outputs", {})),
+            # Keep the full wiring, INCLUDING pb's step-layer flow tokens
+            # (``_layer_in_N: [_layer_token_{N-1}]`` / ``_layer_out_N:
+            # [_layer_token_N]``). The realized v2ecoli baseline is wired by pb's
+            # ``wire_step_layers`` into a linear token chain, and that chain is the
+            # dependency data pb's ``build_step_network`` / ``determine_steps``
+            # order the start cascade by. The whole model's real stores (bulk /
+            # unique / timestep) are read-and-written by nearly every step, so
+            # they are all self-loops that create NO ordering edges; the token
+            # chain is what makes the cascade a total order. Stripping it (the old
+            # behavior) left the Rust scheduler to reconstruct order from the
+            # self-loop-only data wiring, so it batched steps pb runs in sequence
+            # (e.g. ProteinDegradation into layer 0, ahead of Equilibrium) — the
+            # source of the M5 non-bit-identity. The token stores themselves are
+            # absent from the state and never read/written at runtime (a step's
+            # process returns only its real ports, and map_updates drops writes to
+            # absent paths), so the tokens are purely scheduling markers.
+            "inputs": edge.get("inputs", {}),
+            "outputs": edge.get("outputs", {}),
         }
+        # Carry pb's step ``priority`` through too (the Rust scheduler's
+        # cycle-resolution tie-break, matching process_bigraph 1.8.3
+        # ``determine_steps``). With the flow-token chain above present the
+        # baseline's step graph is already a total order so priority is not
+        # consulted, but a realized composite wired WITHOUT layer tokens would
+        # fall back on it, so passing it keeps the handoff faithful to pb.
+        priority = edge.get("priority")
+        if priority is not None:
+            node["priority"] = priority
         if edge.get("interval") is not None:
             node["interval"] = edge["interval"]
         if _is_emitter(address):

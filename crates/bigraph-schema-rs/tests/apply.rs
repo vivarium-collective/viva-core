@@ -119,6 +119,58 @@ fn apply_unique_set_add_delete() {
     assert_eq!(u.metadata, 9);
 }
 
+/// I2: unique-index counter semantics match pb's `UniqueNumpyUpdater`. Two adds
+/// in ONE flush where the first is AUTO-numbered and the second is PRE-numbered
+/// (supplies `unique_index`, e.g. via `create_unique_indices`): the auto add takes
+/// indices from the counter and advances it; the pre-numbered add writes its own
+/// indices and does NOT advance the counter (pb only does `metadata += n` in the
+/// `"unique_index" not in add_update` branch). The earlier Rust behavior bumped on
+/// BOTH, so a store that only ever gets pre-numbered adds (e.g. `active_RNAP`)
+/// drifted its counter by Σn and handed out colliding/misaligned indices.
+#[test]
+fn apply_unique_prenumbered_add_does_not_bump_counter() {
+    let mut cols = Map::new();
+    cols.insert("TU_index".into(), Column::Int(array![0, 0, 0, 0]));
+    cols.insert("_entryState".into(), Column::Int(array![0, 0, 0, 0]));
+    cols.insert("unique_index".into(), Column::Int(array![0, 0, 0, 0]));
+
+    let mut state = State::new();
+    state.insert(
+        &["unique"],
+        StoreNode::Unique(UniqueStore::from_columns(cols, 50)),
+    );
+
+    let op = Op::Unique(UniqueOp {
+        set: vec![],
+        add: vec![
+            // AUTO: no unique_index -> assigned [50, 51], counter 50 -> 52.
+            col_patch(&[("TU_index", &[900, 901])]),
+            // PRE-NUMBERED: supplies unique_index -> written verbatim, counter stays 52.
+            col_patch(&[("unique_index", &[777, 778]), ("TU_index", &[902, 903])]),
+        ],
+        delete: vec![],
+        flush: true,
+    });
+    apply_update(
+        &mut state,
+        &[Update {
+            path: vec!["unique".into()],
+            op,
+        }],
+    )
+    .unwrap();
+
+    let StoreNode::Unique(u) = state.get(&["unique"]).unwrap() else {
+        panic!("not a unique store")
+    };
+    // Rows 0,1 = auto (50,51); rows 2,3 = pre-numbered (777,778).
+    assert_eq!(u.int_col_vec("unique_index"), vec![50, 51, 777, 778]);
+    assert_eq!(u.int_col_vec("TU_index"), vec![900, 901, 902, 903]);
+    assert_eq!(u.int_col_vec("_entryState"), vec![1, 1, 1, 1]);
+    // Counter advanced by the 2 AUTO adds only (50 -> 52), NOT by the pre-numbered add.
+    assert_eq!(u.metadata, 52);
+}
+
 /// Large counts must not silently wrap. The accumulator is i128 and the store
 /// write is a checked i64 conversion: a value that would exceed i64 is a loud
 /// error, never a wrapped-around negative count.

@@ -35,17 +35,21 @@ What this proves (asserted below):
     typed ``map[float]``) MERGES per-leaf additively, matching pb, rather than
     hitting the wholesale ``Op::Overwrite`` arm.
 
-What this does NOT yet prove (the honest residual, recorded — not faked):
-  * the whole-model run is NOT bit-identical to pb 1.8.3. It diverges at the
-    float-precision level in the numerically-sensitive early processes: at
-    ``metabolism``'s first update (tick 0) the bulk total already differs by a
-    handful of counts out of ~3e10 (a ~1e-10 relative difference), i.e. an
-    upstream ODE/stochastic process (equilibrium / complexation / degradation)
-    produces a slightly different output, which the metabolism FBA and the
-    downstream stochastic steps amplify over ticks (e.g. RNA-init counts,
-    exchange fluxes). Both engines are internally deterministic, so this is a
-    reproducible numerical-sensitivity residual, not non-determinism and not a
-    structural blocker. See docs/milestone-5-results.md.
+What this now ALSO proves (the M5 bit-identity deliverable):
+  * the whole-model run IS bit-identical to pb 1.8.3 over two ticks — bulk counts
+    int-exact, float leaves within 1e-12, pint Quantities equal in magnitude and
+    units (``test_wholemodel_bit_identical_to_pb``). The earlier milestone drafted
+    this as an ``xfail`` and attributed the residual to "float-precision / numba
+    sensitivity"; that diagnosis was wrong. The residual was a scheduler-fidelity
+    defect: the realized baseline is wired by pb's ``wire_step_layers`` into a
+    linear ``_layer_token`` chain, and ``build_payload`` was STRIPPING those
+    tokens — so the Rust scheduler reconstructed the start-cascade order from the
+    real data wiring alone, where bulk/unique/timestep are read-and-written by
+    nearly every step (self-loops that create no ordering edges). It therefore ran
+    steps in the wrong order (e.g. ProteinDegradation ahead of Equilibrium), and
+    ``stochasticRound`` + the near-degenerate FBA LP amplified that integer-count
+    seed into a ~3e-7 bulk drift. Passing the flow tokens through the handoff
+    closes it exactly. See docs/milestone-5-results.md.
 """
 
 import os
@@ -185,34 +189,187 @@ def test_known_unknown_b_nested_map_merges_additively(ctx):
 
 
 # --------------------------------------------------------------------------- #
-# The honest residual: NOT bit-identical. Recorded (xfail), not faked.
+# The M5 deliverable: the whole model is BIT-IDENTICAL to pb 1.8.3.
+#
+# This was the xfail gate while the residual was open. The residual was a
+# scheduler-fidelity defect, NOT float noise: the realized baseline is wired by
+# pb's ``wire_step_layers`` into a linear ``_layer_token`` chain, and the handoff
+# was stripping those tokens — so the Rust scheduler could not reproduce pb's
+# start-cascade order (it ran e.g. ProteinDegradation before Equilibrium) and the
+# stochastic reads + FBA LP amplified that integer-count seed. Passing the tokens
+# through (prebuilt.build_payload) closed it; the model is now bit-identical.
+# See docs/milestone-5-results.md.
 # --------------------------------------------------------------------------- #
 
-@pytest.mark.xfail(
-    reason="M5 residual: whole model runs + is deterministic but not bit-identical "
-    "to pb 1.8.3 — a ~1e-10 relative divergence in the early numerically-sensitive "
-    "processes (metabolism FBA / elongation ODE / stochastic init) that amplifies "
-    "over ticks. See docs/milestone-5-results.md.",
-    strict=True,
-)
+
+def _norm_array(v):
+    """Normalize a structured array (pb state) or dict-of-columns (run_prebuilt
+    final state) to an ordered ``{column: ndarray}`` dict."""
+    names = getattr(getattr(v, "dtype", None), "names", None)
+    if names:  # structured ndarray
+        return {n: np.asarray(v[n]) for n in names}
+    if isinstance(v, dict):  # already columns
+        return {k: np.asarray(x) for k, x in v.items()}
+    return None
+
+
+def _assert_leaf_equal(ref, got, path):
+    """Assert one leaf is bit-identical: ints exact, floats within 1e-12, pint
+    Quantities equal in magnitude (<=1e-12) AND units, strings/bools exact."""
+    # pint Quantities: magnitude + units must both match.
+    if isinstance(ref, pint.Quantity) or isinstance(got, pint.Quantity):
+        assert isinstance(ref, pint.Quantity) and isinstance(got, pint.Quantity), (
+            f"{path}: pint vs non-pint ({type(ref).__name__} vs {type(got).__name__})"
+        )
+        assert ref.units == got.units, f"{path}: units {ref.units} != {got.units}"
+        _assert_leaf_equal(np.asarray(ref.magnitude), np.asarray(got.magnitude), path + ".magnitude")
+        return
+
+    cols_ref, cols_got = _norm_array(ref), _norm_array(got)
+    if cols_ref is not None and cols_got is not None:
+        # The unique stores are v2ecoli ``MetadataArray``s carrying the
+        # next-unique-index counter: pb holds it as a ``.metadata`` attribute, the
+        # decoded run_prebuilt state as a ``_metadata`` pseudo-column. Compare it
+        # against pb's attribute (int-exact) — this is the I2 shared-counter value.
+        md_col = cols_got.pop("_metadata", None)
+        ref_md = getattr(ref, "metadata", None)
+        if md_col is not None or ref_md is not None:
+            assert md_col is not None and ref_md is not None, (
+                f"{path}: unique-index counter present on one side only"
+            )
+            got_md = int(np.asarray(md_col).ravel()[0])
+            assert got_md == int(ref_md), (
+                f"{path}: unique-index counter {got_md} != pb {int(ref_md)}"
+            )
+        assert set(cols_ref) == set(cols_got), f"{path}: columns {set(cols_ref)} != {set(cols_got)}"
+        for c in cols_ref:
+            _assert_leaf_equal(cols_ref[c], cols_got[c], f"{path}[{c}]")
+        return
+
+    a, b = np.asarray(ref), np.asarray(got)
+    # Both empty = no entries to diff. An empty unique store's 2-D field (e.g.
+    # ``boundary_molecule_indexes``) is pb-shaped ``(0, 2)`` but decodes to
+    # ``(0,)``; with zero rows that is the same (absence of) data, not a divergence.
+    if a.size == 0 and b.size == 0:
+        return
+    assert a.shape == b.shape, f"{path}: shape {a.shape} != {b.shape}"
+    if np.issubdtype(a.dtype, np.integer) or a.dtype == bool or a.dtype.kind in "US":
+        assert np.array_equal(a, b), f"{path}: int/bool/str array differs"
+    elif np.issubdtype(a.dtype, np.floating):
+        # exact where finite; else bounded by 1e-12 absolute-or-relative.
+        if not np.array_equal(a, b):
+            fin = np.isfinite(a) & np.isfinite(b)
+            assert np.array_equal(np.isfinite(a), np.isfinite(b)), f"{path}: non-finite mask differs"
+            diff = np.abs(a[fin] - b[fin])
+            tol = 1e-12 * np.maximum(1.0, np.abs(a[fin]))
+            assert np.all(diff <= tol), f"{path}: float max|Δ| {diff.max():.3e} exceeds 1e-12"
+    else:
+        assert np.array_equal(a, b), f"{path}: array differs"
+
+
+# Stores holding live handle objects (process-as-data, RNG) travel out-of-band
+# and are not state leaves to diff; the RNG being in sync is proven by the bulk
+# trajectory being bit-identical over the ticks (any RNG drift would show there).
+# ``process``/``allocator_rng`` are live-handle stores (not diffable leaves).
+# ``global_time``/``next_update_time`` are scheduler time BOOKKEEPING, not model
+# state: ``pb.run(N)`` ends labelled global_time N while ``run_prebuilt(n_ticks=N)``
+# ends at N+1 (the documented duration-vs-iteration convention — both run every
+# process the SAME number of times), so these clocks carry a benign +1 offset that
+# is not a state divergence. See docs/milestone-5-results.md (M2).
+_HANDLE_KEYS = {"process", "allocator_rng", "global_time", "next_update_time"}
+
+# Leaves that are a pure function of the ``global_time`` LABEL (not of model
+# state), so they inherit the benign +1 duration-vs-iteration offset above and
+# are not a state divergence: ``expected_mass_fold_change = 2**((global_time -
+# timeInitial)/cell_cycle_len)`` (mass_deriver) differs only because the clock is
+# labelled t+1. Excluded for the same reason as the clock itself (M2). Every
+# model-state leaf (bulk, unique, masses, counts, fluxes, …) is still compared.
+_CLOCK_DERIVED_LEAVES = {"expected_mass_fold_change"}
+
+# KNOWN RESIDUAL (tracked, not noise) — the "schema-projection apply gap".
+#
+# pb applies every update through the STORE's composition schema: a store typed
+# ``integer`` or ``array[integer]`` (and the ``*_vec`` labeled-array listener
+# types) accumulates additively across ticks, even when the WRITER declares
+# ``overwrite[integer]`` or returns a plain int array. The Rust engine instead
+# picks the apply op from the writer's declared OUTPUT-PORT type (Integer ->
+# additive, but Array / Named / Overwrite -> overwrite) and has no element-wise
+# integer-array additive op, so these additive-store listener leaves are
+# OVERWRITTEN (kept at the last tick) instead of accumulated. These are diagnostic
+# listener sinks — the core model state (bulk, unique incl. the index counter, all
+# masses/concentrations/fluxes, every pint Quantity) is bit-identical, which is why
+# the trajectory does not diverge. Closing this needs the composition schema's
+# per-store apply-types carried into the handoff so the engine projects through
+# them (the same architectural gap as the I3 map-vs-node schema-absent-path drop);
+# it is beyond the M5 scheduler/counter scope. Pinned by the strict-xfail
+# ``test_listener_schema_projection_residual`` below. See task-4-fix-report.md.
+_SCHEMA_PROJECTION_RESIDUAL = {
+    "atp_requested",             # listeners/atp — allocator, array[n_processes,integer]
+    "atp_allocated_initial",     # listeners/atp — allocator, array[n_processes,integer]
+    "rna_init_event_per_cistron",  # listeners/rnap_data — rna_init_event_per_cistron_vec
+    "did_initialize",            # listeners/rnap_data — store integer, writer overwrite[integer]
+    "total_rna_init",            # listeners/rna_synth_prob — store integer, writer overwrite[integer]
+    "n_actual_bound",            # listeners/rna_synth_prob — array[n_TF,integer]
+}
+
+
+def _is_edge(v):
+    return isinstance(v, dict) and "address" in v and ("inputs" in v or "outputs" in v)
+
+
+def _assert_bit_identical(ref, got, path="agent"):
+    if isinstance(ref, dict):
+        assert isinstance(got, dict), f"{path}: dict vs {type(got).__name__}"
+        # Compare only DATA stores: skip handle stores, edge (process/step) dicts
+        # — which are not part of the decoded final state — and pb's scheduler
+        # flow-token stores (``_layer*``, scheduling-only, never materialized).
+        def data_keys(d):
+            return {
+                k
+                for k, v in d.items()
+                if k not in _HANDLE_KEYS
+                and k not in _CLOCK_DERIVED_LEAVES
+                and k not in _SCHEMA_PROJECTION_RESIDUAL
+                and not str(k).startswith("_layer")
+                and not _is_edge(v)
+            }
+
+        ref_keys = data_keys(ref)
+        got_keys = data_keys(got)
+        # ``got`` is the decoded final state; it must carry every schema store pb has.
+        missing = ref_keys - got_keys
+        assert not missing, f"{path}: run_prebuilt output missing stores {sorted(missing)}"
+        for k in ref_keys:
+            if k in got:
+                _assert_bit_identical(ref[k], got[k], f"{path}/{k}")
+    else:
+        _assert_leaf_equal(ref, got, path)
+
+
 def test_wholemodel_bit_identical_to_pb(ctx):
-    """ASPIRATIONAL gate (xfail-strict): the whole model bit-identical to pb. Trips
-    GREEN the day the numerical residual is closed (then flip to a hard assert)."""
+    """M5 DELIVERABLE: the whole realized baseline run on the Rust engine is
+    bit-identical to pb 1.8.3 over two start cascades + two ticks — bulk counts
+    int-exact, unique stores (incl. the next-unique-index counter) int-exact, every
+    float leaf within 1e-12, every pint Quantity equal in magnitude and units.
+
+    Was xfail(strict) while the residual was open; the residual was the
+    scheduler-ordering defect (stripped ``_layer`` flow tokens) + the unique-index
+    counter gap, both now fixed, so this is a hard assert. The six additive-store
+    diagnostic listener leaves in ``_SCHEMA_PROJECTION_RESIDUAL`` are excluded and
+    tracked separately (``test_listener_schema_projection_residual``)."""
     core, bundle = ctx
     ref = Composite(baseline(core, seed=0, cache_dir=CACHE, bundle=bundle), core=core)
     ref.run(2.0)
-    ref_bulk = _bulk_count(ref.state["agents"]["0"])
-    got_bulk = _bulk_count(
-        prebuilt.run_from_state(_fresh(core, bundle), n_ticks=2, path=("agents", "0"))
-    )
-    assert np.array_equal(ref_bulk, got_bulk)
+    got = prebuilt.run_from_state(_fresh(core, bundle), n_ticks=2, path=("agents", "0"))
+    # Headline: bulk count array int-exact.
+    assert np.array_equal(_bulk_count(ref.state["agents"]["0"]), _bulk_count(got))
+    # Full deep state comparison (bulk / unique / listeners / environment / pint).
+    _assert_bit_identical(ref.state["agents"]["0"], got)
 
 
-def test_wholemodel_divergence_is_small_and_late(ctx):
-    """Bound the residual honestly: the whole-model bulk total is within a ~1e-8
-    RELATIVE band of pb after two ticks (same magnitude, deterministic), i.e. the
-    model runs *correctly* — the residual is float-precision sensitivity, not a
-    gross error."""
+def test_wholemodel_bulk_total_exact(ctx):
+    """The whole-model bulk total matches pb exactly (relative divergence 0) after
+    two ticks — the residual the earlier milestone bounded at <1e-6 is now closed."""
     core, bundle = ctx
     ref = Composite(baseline(core, seed=0, cache_dir=CACHE, bundle=bundle), core=core)
     ref.run(2.0)
@@ -222,5 +379,40 @@ def test_wholemodel_divergence_is_small_and_late(ctx):
             prebuilt.run_from_state(_fresh(core, bundle), n_ticks=2, path=("agents", "0"))
         ).sum()
     )
-    rel = abs(ref_sum - got_sum) / max(1, abs(ref_sum))
-    assert rel < 1e-6, f"bulk total relative divergence {rel:.2e} exceeds 1e-6"
+    assert ref_sum == got_sum, f"bulk total {got_sum} != pb {ref_sum}"
+
+
+@pytest.mark.xfail(
+    reason="Schema-projection apply gap: additive-store diagnostic listeners "
+    "(integer / array[integer] / *_vec) are OVERWRITTEN by the Rust engine (it "
+    "picks the apply op from the writer's declared port type and has no element-wise "
+    "integer-array additive op) instead of being accumulated through the store's "
+    "composition schema as pb does. Not scheduler ordering and not float noise — a "
+    "deeper schema-in-handoff gap, same family as the I3 map-vs-node drop. Flips "
+    "green when the engine projects updates through the store schema. See "
+    "task-4-fix-report.md.",
+    strict=True,
+)
+def test_listener_schema_projection_residual(ctx):
+    """Pins the known residual: the six additive-store listener leaves SHOULD be
+    bit-identical to pb but are overwritten (kept at the last tick) rather than
+    accumulated. Asserting their bit-identity fails today (xfail) and will pass once
+    the engine applies these through the store's composition schema."""
+    core, bundle = ctx
+    ref = Composite(baseline(core, seed=0, cache_dir=CACHE, bundle=bundle), core=core)
+    ref.run(2.0)
+    rs = ref.state["agents"]["0"]
+    got = prebuilt.run_from_state(_fresh(core, bundle), n_ticks=2, path=("agents", "0"))
+    checked = 0
+    for sub, leaves in rs["listeners"].items():
+        if not isinstance(leaves, dict):
+            continue
+        for leaf, rval in leaves.items():
+            if leaf not in _SCHEMA_PROJECTION_RESIDUAL:
+                continue
+            gval = got["listeners"][sub][leaf]
+            assert np.array_equal(np.asarray(rval), np.asarray(gval)), (
+                f"listeners/{sub}/{leaf} differs (schema-projection residual)"
+            )
+            checked += 1
+    assert checked > 0, "expected to find the residual listener leaves"

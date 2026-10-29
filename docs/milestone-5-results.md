@@ -16,9 +16,15 @@ through the realized-`Composite` handoff (`build_payload(comp, path=("agents",
 "0"))`). M4 could not even build the payload; M5 makes the whole model run.
 
 The run is **deterministic** (repeated run_prebuilt runs are byte-for-byte
-identical) but is **NOT yet bit-identical to pb 1.8.3**: a small, reproducible,
-float-precision-level divergence remains in the numerically-sensitive early
-processes and amplifies over ticks (the honest residual, below).
+identical) and is now **bit-identical to pb 1.8.3** in all core model state — bulk
+counts int-exact, unique stores (including the next-unique-index counter)
+int-exact, every float leaf within 1e-12, every pint Quantity equal in magnitude
+and units. The earlier "float-precision residual" diagnosis was **wrong**: the
+divergence was a deterministic **scheduler-ordering** defect (plus a unique-index
+counter gap), both now fixed (see "Root cause" below). One narrow, precisely
+located residual remains in six additive-store diagnostic listener leaves (the
+schema-projection apply gap), tracked as a strict-xfail — it does not perturb the
+model trajectory.
 
 This is an **enablement / correctness-plumbing** milestone, not a speed one — see
 the number.
@@ -103,40 +109,80 @@ crossing per tick on top of pb's in-process scheduling. The whole-model speedup
 is the **M6+ native-port program** (porting the hot processes to Rust twins; the
 one ported process, `ProteinDegradation`, is already > 1x native-ON in M3/M4).
 
-## The honest residual — NOT bit-identical
+## Root cause of the former divergence (bit-identity now achieved)
 
-The whole-model run is deterministic but diverges from pb at the float-precision
-level. Localized: at `ecoli-metabolism`'s **first** update (tick 0) the bulk
-total already differs by ~8 counts out of ~3e10 (a ~1e-10 relative difference) —
-i.e. an **upstream** numerically-sensitive process (an ODE/stochastic step such
-as equilibrium / complexation / rna-degradation, run before metabolism in the
-step order) produces a slightly different output. The metabolism FBA and the
-downstream stochastic steps then **amplify** it over ticks (e.g. `rna_synth_prob`
-init counts, `environment.exchange` fluxes). After two ticks the bulk-total
-relative divergence is ~3e-7.
+The ~3e-7 bulk-total divergence after two ticks was **NOT** float/numba noise. It
+was a deterministic **step-scheduler ordering** defect, with a secondary
+unique-index counter gap. Both are fixed; the core model is now bit-identical.
 
-Both engines are internally deterministic, so this is a **reproducible numerical
--sensitivity residual, not randomness and not a structural blocker** — the model
-runs *correctly* (same magnitude, same trajectory shape), just not bit-for-bit.
-The likely root is a sub-tick representation difference (numpy operation ordering
-/ list-vs-ndarray / float round-trip) in a hot ODE or numba kernel feeding FBA;
-closing it to true bit-identity is follow-up work. The aspirational gate
-`test_wholemodel_bit_identical_to_pb` is `xfail(strict=True)` and flips green the
-day the residual is closed.
+1. **Scheduler ordering (the primary cause).** The realized v2ecoli baseline is
+   wired by pb's `wire_step_layers` into a linear flow-token chain — every step
+   reads `_layer_token_{N-1}` and writes `_layer_token_N`, and that chain is the
+   data dependency pb's `build_step_network` / `determine_steps` order the start
+   cascade by. The handoff (`prebuilt.build_payload`, via `_strip_layer_ports`)
+   was **stripping those tokens**. The whole model's real stores (bulk / unique /
+   timestep) are read-and-written by nearly every step, so they are self-loops
+   that create no ordering edges; with the tokens gone the Rust scheduler had no
+   total order and ran steps in document order — e.g. `ProteinDegradation` *before*
+   `Equilibrium`, where pb runs `Equilibrium` first. `stochasticRound` and the
+   near-degenerate FBA LP then amplified that integer-count seed into the drift.
+   **Fix:** pass the `_layer*` flow tokens (and `priority`) through the handoff so
+   the Rust scheduler reproduces pb's exact layer order. The whole start cascade
+   now matches pb step-for-step and the bulk/unique state is bit-identical.
+
+2. **Unique-index counter (secondary).** When a process pre-numbers an `add`
+   (supplies `unique_index`, e.g. via `create_unique_indices`), pb does NOT bump
+   the store counter on apply, and `create_unique_indices`'s in-place `.metadata`
+   bump on the shared array is seen by the auto-numbered add that follows. The
+   handoff view is detached, so the Rust engine (a) wrongly bumped the counter on
+   pre-numbered adds and (b) lost the in-place bump. **Fix:** `flush_unique` bumps
+   only on auto-numbered adds (matching `UniqueNumpyUpdater`), and each process's
+   `.metadata` delta is read back off its view and replayed against the store
+   (`Process::take_metadata_writebacks`). `active_RNAP` and all unique indices now
+   match pb exactly.
+
+Also note the benign **+1 global_time label offset**: `pb.run(N)` ends labelled
+global_time N, `run_prebuilt(n_ticks=N)` at N+1, while both run every process the
+same number of times (the documented duration-vs-iteration convention). The clocks
+and the one purely-clock-derived listener (`expected_mass_fold_change`) carry this
+offset; it is not a state divergence.
+
+## Remaining residual — the schema-projection apply gap (narrow, tracked)
+
+Six **additive-store diagnostic listener** leaves still differ:
+`listeners/atp/{atp_requested,atp_allocated_initial}`,
+`listeners/rnap_data/{rna_init_event_per_cistron,did_initialize}`,
+`listeners/rna_synth_prob/{total_rna_init,n_actual_bound}`. pb applies every update
+through the **store's** composition schema, so a store typed `integer` /
+`array[integer]` / a `*_vec` labeled array accumulates additively across ticks —
+even when the writer declares `overwrite[integer]` or returns a plain int array.
+The Rust engine instead picks the apply op from the **writer's** declared
+output-port type (Integer -> additive, but Array / Named / Overwrite -> overwrite)
+and has no element-wise integer-array additive op, so these leaves are overwritten
+(kept at the last tick) rather than accumulated. They are diagnostic sinks — the
+core trajectory is unaffected (bulk/unique/masses/fluxes are bit-identical), which
+is why this was masked until the ordering defect was fixed. Closing it needs the
+composition schema's per-store apply-types carried into the handoff so the engine
+projects updates through them (the same architectural gap as the schema-absent-path
+map-vs-node drop). This is beyond the M5 scheduler/counter scope and is pinned by
+the strict-xfail `test_listener_schema_projection_residual`.
 
 ## Scope recorded
 
 One generation, baseline media, single seed, no functional division. The whole
-model runs on the Rust engine and is deterministic; it is not yet bit-identical
-(float-precision residual above) and not yet faster (PyO3 tax; speedup is M6+).
+model runs on the Rust engine, is deterministic, and is bit-identical to pb 1.8.3
+in all core model state (one tracked listener residual above); it is not yet faster
+(PyO3 tax; speedup is M6+).
 
 ## Tests
 
 - `python/tests/test_wholemodel_runs.py` — the whole model runs end-to-end
   native-OFF, is deterministic, exercises the `Composite`+`path` handoff with the
   real partitioned processes + handle table (no wire-symmetry false-positive),
-  and closes known-unknowns (a) and (b); the bit-identity gate is `xfail-strict`
-  and the divergence is bounded (< 1e-6 relative) by a hard assert.
+  and closes known-unknowns (a) and (b); `test_wholemodel_bit_identical_to_pb`
+  hard-asserts bit-identity over all core state (bulk/unique/float/Quantity), and
+  the six-leaf schema-projection residual is pinned by the strict-xfail
+  `test_listener_schema_projection_residual`.
 - M1–M4 conformance + Tasks 1–3 stay green in both native-flag modes.
 
 ## Reproduce

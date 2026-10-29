@@ -12,6 +12,10 @@ use bigraph_schema_rs::state::{State, StoreNode};
 /// Port name -> type string (`"float"`, `"overwrite[float]"`, ...).
 pub type Ports = Vec<(String, String)>;
 
+/// A unique-index counter write-back: `(absolute store path, metadata delta)`.
+/// See [`Process::take_metadata_writebacks`].
+pub type MetadataWriteback = (Vec<String>, i128);
+
 #[derive(Debug, thiserror::Error, PartialEq)]
 #[error("process error: {0}")]
 pub struct ProcessError(pub String);
@@ -58,6 +62,17 @@ pub trait Process {
     /// Emitters expose their captured rows here.
     fn history(&self) -> Option<Vec<Row>> {
         None
+    }
+    /// Unique-index counter write-backs produced by the most recent `update`,
+    /// as `(absolute store path, delta)` pairs, draining the buffer.
+    ///
+    /// pb's `create_unique_indices` bumps a unique store's `.metadata` in place on
+    /// the array the process reads. A native process never does this; the PyO3
+    /// process path overrides this to report the net `.metadata` change observed on
+    /// each unique view after the Python `update` ran, so the engine can replay it
+    /// against the (detached) store — matching pb's shared-array semantics.
+    fn take_metadata_writebacks(&mut self) -> Vec<MetadataWriteback> {
+        Vec::new()
     }
 }
 

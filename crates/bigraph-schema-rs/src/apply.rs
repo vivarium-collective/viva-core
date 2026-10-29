@@ -92,6 +92,31 @@ pub fn apply_update(state: &mut State, updates: &[Update]) -> Result<(), ApplyEr
     Ok(())
 }
 
+/// Apply a per-process unique-index counter write-back: `store.metadata += delta`.
+///
+/// pb's `create_unique_indices` bumps the unique store's `.metadata` IN PLACE on
+/// the array a process reads, so a later auto-numbered add (and the next process)
+/// sees the advanced counter. The PyO3 handoff gives each process a detached
+/// `MetadataArray` view, so that in-place bump is read back after the process runs
+/// (see `Process::take_metadata_writebacks`) and replayed here against the store.
+pub fn add_unique_metadata(
+    state: &mut State,
+    path: &[String],
+    delta: i128,
+) -> Result<(), ApplyError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let node = state
+        .get_mut_path(path)
+        .ok_or_else(|| ApplyError::PathNotFound(path.to_vec()))?;
+    let StoreNode::Unique(store) = node else {
+        return Err(ApplyError::TypeMismatch(path.to_vec()));
+    };
+    store.metadata += delta;
+    Ok(())
+}
+
 fn apply_one(node: &mut StoreNode, op: &Op, path: &[String]) -> Result<(), ApplyError> {
     match op {
         Op::BulkDelta(deltas) => {
@@ -243,16 +268,22 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
         let free = store.get_free_indices(n_new);
         let itemsize = store.layout.itemsize;
 
-        // Advance the next-unique-index counter by the number added, in BOTH the
-        // auto-assign and the pre-assigned (`unique_index` supplied) cases. pb
-        // bumps the counter by `n_new` either way: the updater does
-        // `result.metadata += n_new` when it auto-numbers, and
-        // `create_unique_indices` does `metadata += n` on the SAME store array
-        // when a process pre-numbers (then supplies `unique_index`). The view's
-        // `.metadata` is a fresh attribute here, so its pre-number bump does not
-        // flow back — advancing the store counter on apply reproduces pb's state.
-        let base = store.metadata;
+        // Assign `unique_index` from the counter and advance it ONLY when the add
+        // does NOT supply `unique_index`, exactly as pb's `UniqueNumpyUpdater`:
+        //
+        //   if "unique_index" not in add_update:
+        //       result["unique_index"][free] = arange(n_new) + result.metadata
+        //       result.metadata += n_new
+        //
+        // When a process PRE-numbers (supplies `unique_index`, e.g. via
+        // `create_unique_indices`), pb does NOT bump the store counter here — the
+        // bump already happened in-place on the view the process read, and that is
+        // reproduced by the per-process metadata write-back in the engine (see
+        // `Engine::invoke` / `Process::take_metadata_writebacks`). Bumping again
+        // here would double-count (the earlier behavior left `active_RNAP.metadata`
+        // at base+Σn_pre-numbered instead of pb's unchanged value).
         if !add.contains_key("unique_index") {
+            let base = store.metadata;
             if let Some(fl) = store.layout.field("unique_index").cloned() {
                 let buf = Arc::make_mut(&mut store.buf);
                 for (k, &row) in free.iter().enumerate() {
@@ -263,8 +294,8 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
                     write_cell(buf, itemsize, row, &fl, &Value::Int(x));
                 }
             }
+            store.metadata = base + n_new as i128;
         }
-        store.metadata = base + n_new as i128;
 
         {
             let layout = &store.layout;
