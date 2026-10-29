@@ -12,7 +12,7 @@ use pyo3::types::{IntoPyDict, PyCapsule};
 use pyo3::types::{PyAnyMethods, PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
 use bigraph_schema_rs::apply::{Op, UniqueOp};
-use bigraph_schema_rs::doc::{Map, Value};
+use bigraph_schema_rs::doc::{Map, TagKind, Value};
 use bigraph_schema_rs::grammar::parse_type;
 use bigraph_schema_rs::state::{
     parse_field_dtype, parse_subarray_dtype, read_value, FieldLayout, RecordLayout, State,
@@ -45,6 +45,15 @@ pub fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny
             }
             list.into_any()
         }
+        // A pint Quantity leaf: rebuild a real `pint.Quantity` (Option A) rather
+        // than hand back a plain dict, restoring the magnitude dtype so a reader
+        // gets `np.float64` not a demoted Python `float`.
+        Value::Tagged(TagKind::Pint, m) => pint_to_py(py, m)?,
+        // A plain numpy ndarray leaf (`__numpy__`): rebuild the real ndarray so a
+        // reader doing array math / fancy-indexing (e.g.
+        // `basal_prob[TU_index]`) gets an ndarray, not a Python list, and the
+        // final state compares equal to pb's ndarray. Closes M5 known-unknown (a).
+        Value::Tagged(TagKind::Numpy, m) => numpy_to_py(py, m)?,
         Value::Map(m) | Value::Tagged(_, m) => {
             let d = PyDict::new(py);
             for (k, x) in m {
@@ -53,6 +62,259 @@ pub fn value_to_py<'py>(py: Python<'py>, v: &Value) -> PyResult<Bound<'py, PyAny
             d.into_any()
         }
     })
+}
+
+// ---- pint Quantity bridge (Option A: opaque tag in Rust, wrap/unwrap here) --
+
+/// Cached `bigraph_schema.units.get_quantity_registry()` handle — the registry
+/// v2ecoli installs as the pint application registry, so decoded Quantities are
+/// registry-coherent with v2ecoli's (incl. units like `amino_acid`).
+fn quantity_registry<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static REG: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    REG.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py
+            .import("bigraph_schema.units")?
+            .getattr("get_quantity_registry")?
+            .call0()?
+            .unbind())
+    })
+    .map(|r| r.bind(py).clone())
+}
+
+/// Cached `pint.Quantity` base class for the `isinstance` check in `py_to_value`.
+fn pint_quantity_cls<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    CLS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("pint")?.getattr("Quantity")?.unbind())
+    })
+    .map(|c| c.bind(py).clone())
+}
+
+/// Cached `numpy.generic` — the base of numpy scalar types (e.g. `np.float64`),
+/// used to tell a numpy-scalar magnitude from a Python scalar / an ndarray.
+fn numpy_generic_cls<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    CLS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("numpy")?.getattr("generic")?.unbind())
+    })
+    .map(|c| c.bind(py).clone())
+}
+
+/// `Some(obj)` if `obj` is a `pint.Quantity`, else `None` (never errors — a
+/// failed pint import just means "not a Quantity").
+fn as_pint_quantity<'a, 'py>(obj: &'a Bound<'py, PyAny>) -> Option<&'a Bound<'py, PyAny>> {
+    let cls = pint_quantity_cls(obj.py()).ok()?;
+    if obj.is_instance(&cls).unwrap_or(false) {
+        Some(obj)
+    } else {
+        None
+    }
+}
+
+/// Lower a `pint.Quantity` to `Value::Tagged(Pint, {..})`, preserving the
+/// magnitude dtype so [`pint_to_py`] can rebuild `np.float64` vs a Python
+/// `float` (the `1/Quantity(0.0)` inf-vs-`ZeroDivisionError` hazard). A numpy
+/// scalar magnitude records a viva-core-private `__viva_scalar_dtype__` key —
+/// `bigraph_json_hook` keys scalars on the *absence* of `__magnitude_dtype__`,
+/// so the private key leaves that decode path (and the scalar vs 0-d-array
+/// distinction) unchanged. An ndarray magnitude uses the upstream
+/// `__magnitude_dtype__` shape.
+fn quantity_to_value(q: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let py = q.py();
+    let mag = q.getattr("magnitude")?;
+    let units = q.getattr("units")?.str()?.to_str()?.to_string();
+    let mut m = Map::new();
+    m.insert("__pint__".to_string(), Value::Bool(true));
+
+    let generic = numpy_generic_cls(py)?;
+    if mag.is_instance(&generic).unwrap_or(false) {
+        // numpy scalar (np.float64, ...): record the private scalar dtype.
+        let dtype = mag.getattr("dtype")?.str()?.to_str()?.to_string();
+        let item = mag.call_method0("item")?;
+        m.insert("magnitude".to_string(), py_to_value(&item)?);
+        m.insert("units".to_string(), Value::Str(units));
+        m.insert("__viva_scalar_dtype__".to_string(), Value::Str(dtype));
+    } else if mag.hasattr("dtype").unwrap_or(false) && mag.hasattr("tolist").unwrap_or(false) {
+        // numpy ndarray magnitude: upstream array shape.
+        let dtype = mag.getattr("dtype")?.str()?.to_str()?.to_string();
+        let lowered = mag.call_method0("tolist")?;
+        m.insert("magnitude".to_string(), py_to_value(&lowered)?);
+        m.insert("units".to_string(), Value::Str(units));
+        m.insert("__magnitude_dtype__".to_string(), Value::Str(dtype));
+    } else {
+        // Python scalar magnitude (float/int): no dtype key -> rebuilds as a
+        // Python scalar.
+        m.insert("magnitude".to_string(), py_to_value(&mag)?);
+        m.insert("units".to_string(), Value::Str(units));
+    }
+    Ok(Value::Tagged(TagKind::Pint, m))
+}
+
+/// Rebuild a `pint.Quantity` from a `Value::Tagged(Pint, {..})`, restoring the
+/// magnitude dtype (numpy scalar / ndarray / Python scalar) recorded by
+/// [`quantity_to_value`] (or the upstream `__magnitude_dtype__` for arrays).
+fn pint_to_py<'py>(py: Python<'py>, m: &Map<Value>) -> PyResult<Bound<'py, PyAny>> {
+    let ureg = quantity_registry(py)?;
+    let units = match m.get("units") {
+        Some(Value::Str(s)) => s.as_str(),
+        _ => return Err(perr("pint tag missing a `units` string")),
+    };
+    let unit_obj = parsed_unit(py, &ureg, units)?;
+    let mag_val = m
+        .get("magnitude")
+        .or_else(|| m.get("value"))
+        .ok_or_else(|| perr("pint tag missing a `magnitude`"))?;
+
+    let np = py.import("numpy")?;
+    let mag_py = if let Some(Value::Str(dt)) = m.get("__magnitude_dtype__") {
+        // array magnitude: np.array(mag, dtype=dt).
+        let lst = value_to_py(py, mag_val)?;
+        np.getattr("array")?
+            .call((lst,), Some(&[("dtype", dt.as_str())].into_py_dict(py)?))?
+    } else if let Some(Value::Str(dt)) = m.get("__viva_scalar_dtype__") {
+        // numpy scalar magnitude: np.dtype(dt).type(mag) -> e.g. np.float64(x).
+        let scalar = value_to_py(py, mag_val)?;
+        np.getattr("dtype")?
+            .call1((dt.as_str(),))?
+            .getattr("type")?
+            .call1((scalar,))?
+    } else {
+        // Python scalar magnitude.
+        value_to_py(py, mag_val)?
+    };
+
+    ureg.getattr("Quantity")?.call1((mag_py, unit_obj))
+}
+
+// ---- plain numpy ndarray bridge (`__numpy__`) ------------------------------
+
+/// Rebuild a numpy ndarray from a `Value::Tagged(Numpy, {..})` tag of the
+/// upstream `json_codec` shape (`{data, dtype, shape}`):
+/// `np.array(data, dtype=dtype).reshape(shape)`.
+fn numpy_to_py<'py>(py: Python<'py>, m: &Map<Value>) -> PyResult<Bound<'py, PyAny>> {
+    let data = m
+        .get("data")
+        .ok_or_else(|| perr("__numpy__ tag missing `data`"))?;
+    let data_py = value_to_py(py, data)?;
+    let np = py.import("numpy")?;
+    let arr = match m.get("dtype") {
+        Some(Value::Str(dt)) => np.getattr("array")?.call(
+            (data_py,),
+            Some(&[("dtype", dt.as_str())].into_py_dict(py)?),
+        )?,
+        _ => np.getattr("array")?.call1((data_py,))?,
+    };
+    if let Some(Value::Array(dims)) = m.get("shape") {
+        let shape: Vec<i64> = dims
+            .iter()
+            .filter_map(|d| match d {
+                Value::Int(i) => Some(*i),
+                Value::UInt(u) => Some(*u as i64),
+                _ => None,
+            })
+            .collect();
+        return arr.call_method1("reshape", (shape,));
+    }
+    Ok(arr)
+}
+
+/// Cached v2ecoli `MetadataArray` class (`Some` only inside a v2ecoli env).
+fn metadata_array_cls<'py>(py: Python<'py>) -> Option<Bound<'py, PyAny>> {
+    static CLS: PyOnceLock<Option<Py<PyAny>>> = PyOnceLock::new();
+    CLS.get_or_init(py, || {
+        py.import("v2ecoli.library.schema")
+            .and_then(|m| m.getattr("MetadataArray"))
+            .map(|c| c.unbind())
+            .ok()
+    })
+    .as_ref()
+    .map(|c| c.bind(py).clone())
+}
+
+/// Wrap a unique-store structured view as a v2ecoli `MetadataArray` carrying
+/// `.metadata = <next unique_index counter>`. Outside a v2ecoli environment (no
+/// such class) the plain view is returned unchanged.
+fn metadata_array<'py>(
+    py: Python<'py>,
+    view: Bound<'py, PyAny>,
+    counter: i128,
+) -> PyResult<Bound<'py, PyAny>> {
+    match metadata_array_cls(py) {
+        Some(cls) => {
+            let kwargs =
+                [("metadata", i64::try_from(counter).unwrap_or(i64::MAX))].into_py_dict(py)?;
+            cls.call((view,), Some(&kwargs))
+        }
+        None => Ok(view),
+    }
+}
+
+/// Cached `numpy.ndarray` class for the `is_plain_ndarray` instance check.
+fn numpy_ndarray_cls<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    static CLS: PyOnceLock<Py<PyAny>> = PyOnceLock::new();
+    CLS.get_or_try_init(py, || -> PyResult<Py<PyAny>> {
+        Ok(py.import("numpy")?.getattr("ndarray")?.unbind())
+    })
+    .map(|c| c.bind(py).clone())
+}
+
+/// True for a numpy ndarray with a plain (non-record) dtype and `ndim >= 1`.
+/// Structured arrays (`dtype.names` set) are bulk/unique stores handled by their
+/// own op arms; numpy scalars (`np.generic`) are not ndarrays; and a 0-d array is
+/// a scalar leaf (pb serves it as a scalar), so all three are excluded and lower
+/// via the scalar/`tolist` path.
+fn is_plain_ndarray(obj: &Bound<'_, PyAny>) -> PyResult<bool> {
+    let cls = numpy_ndarray_cls(obj.py())?;
+    if !obj.is_instance(&cls).unwrap_or(false) {
+        return Ok(false);
+    }
+    if obj.getattr("ndim")?.extract::<usize>()? == 0 {
+        return Ok(false);
+    }
+    let names = obj.getattr("dtype")?.getattr("names")?;
+    Ok(names.is_none())
+}
+
+/// Lower a plain (non-structured) numpy ndarray to `Value::Tagged(Numpy, {..})`
+/// so it round-trips as an ndarray through the Rust state (view + final state),
+/// instead of decaying to a `Value::Array` (Python list). Mirrors the upstream
+/// `json_codec` `__numpy__` shape.
+fn ndarray_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    let dtype = obj.getattr("dtype")?.str()?.to_str()?.to_string();
+    let shape: Vec<Value> = obj
+        .getattr("shape")?
+        .try_iter()?
+        .map(|d| -> PyResult<Value> { Ok(Value::Int(d?.extract::<i64>()?)) })
+        .collect::<PyResult<_>>()?;
+    let data = py_to_value(&obj.call_method0("tolist")?)?;
+    let mut m = Map::new();
+    m.insert("__numpy__".to_string(), Value::Bool(true));
+    m.insert("dtype".to_string(), Value::Str(dtype));
+    m.insert("shape".to_string(), Value::Array(shape));
+    m.insert("data".to_string(), data);
+    Ok(Value::Tagged(TagKind::Numpy, m))
+}
+
+/// Parse (and cache) a pint unit string -> a registry Unit object. The same
+/// ~23 unit strings recur every tick, so parsing them once removes the per-tick
+/// `parse_units` cost.
+fn parsed_unit<'py>(
+    py: Python<'py>,
+    ureg: &Bound<'py, PyAny>,
+    units: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    static CACHE: PyOnceLock<Py<PyDict>> = PyOnceLock::new();
+    let cache = CACHE
+        .get_or_try_init(py, || -> PyResult<Py<PyDict>> {
+            Ok(PyDict::new(py).unbind())
+        })?
+        .bind(py);
+    if let Some(u) = cache.get_item(units)? {
+        return Ok(u);
+    }
+    let unit = ureg.call_method1("parse_units", (units,))?;
+    cache.set_item(units, &unit)?;
+    Ok(unit)
 }
 
 /// Convert an arbitrary Python object (including numpy scalars/arrays) into a
@@ -94,6 +356,13 @@ pub fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         }
         return Ok(Value::Map(m));
     }
+    // pint.Quantity: lower to a Pint-tagged map BEFORE the numpy `tolist`
+    // fallback. An `np.float64`-magnitude Quantity's `tolist()` returns another
+    // Quantity (the fallback would recurse); a Python-float-magnitude Quantity's
+    // `tolist()` raises (it would then drop to `Null`, losing value + units).
+    if let Some(q) = as_pint_quantity(obj) {
+        return quantity_to_value(q);
+    }
     // numpy scalar / ndarray: lower to a Python list/scalar, then recurse.
     if let Ok(tolist) = obj.getattr("tolist") {
         if tolist.is_callable() {
@@ -134,6 +403,12 @@ pub fn storenode_to_py<'py>(
     dtypes: &DtypeMap,
     structured: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    // M5 Task 2: a live-object store path returns its Python-owned handle VERBATIM
+    // (the `(instance,)` tuple so `proc_state[0]` works; the `RandomState` itself),
+    // never a decoded `Value`. The state node here is only a placeholder.
+    if let Some(h) = dtypes.handles.get(path) {
+        return Ok(h.bind(py).clone());
+    }
     Ok(match node {
         StoreNode::Leaf(v) => value_to_py(py, v)?,
         StoreNode::Branch(m) => {
@@ -151,9 +426,18 @@ pub fn storenode_to_py<'py>(
                 // M2 zero-copy: a read-only view over `BulkStore.count`.
                 let view = bulk_count_view(py, &b.count)?;
                 let ids = bulk_ids(py, path, &b.ids, dtypes)?;
+                // The real bulk carries per-molecule submass columns
+                // (`rRNA_submass`, …) that MassDeriver reads via multi-field
+                // indexing `bulk[[...]]`. Expose them zero-copy alongside `count`
+                // so the view answers both single- and multi-field reads like pb's
+                // full structured array; `count` itself stays the zero-copy column.
+                let floats = PyDict::new(py);
+                for (k, a) in &b.floats {
+                    floats.set_item(k, bulk_float_view(py, a)?)?;
+                }
                 py.import("viva_core._bulkview")?
                     .getattr("wrap")?
-                    .call1((view, ids))?
+                    .call1((view, ids, floats))?
             } else {
                 let d = PyDict::new(py);
                 d.set_item("id", &b.ids)?;
@@ -167,7 +451,12 @@ pub fn storenode_to_py<'py>(
         StoreNode::Unique(u) => {
             if structured {
                 // M2 Task 2: a read-only zero-copy view over the interleaved buffer.
-                unique_view(py, &u.buf, &u.layout, dtypes.get(path))?
+                let view = unique_view(py, &u.buf, &u.layout, dtypes.get(path))?;
+                // Expose the store's next-unique-index counter as `.metadata` on a
+                // v2ecoli `MetadataArray`, as pb does: `create_unique_indices`
+                // reads `unique_molecules.metadata` to number molecules a process
+                // adds this tick. Falls back to the plain view outside v2ecoli.
+                metadata_array(py, view, u.metadata)?
             } else {
                 let d = PyDict::new(py);
                 let n = u.len();
@@ -233,6 +522,19 @@ fn count_dtype<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
 /// `writeable=False`: a process cannot mutate Rust state through it (writes go
 /// back as update dicts -> `Op::BulkDelta`). A process must not retain the view
 /// past the run (v2ecoli processes return updates; they do not stash views).
+/// Read-only zero-copy numpy `float64` view over a bulk submass column.
+fn bulk_float_view<'py>(py: Python<'py>, col: &Array1<f64>) -> PyResult<Bound<'py, PyAny>> {
+    if col.as_slice().is_none() {
+        return Ok(PyArray1::from_vec(py, col.to_vec()).into_any());
+    }
+    let pin = PyCapsule::new_with_value(py, (), c"viva_core.bulk_float_pin")?;
+    // SAFETY: `col` is contiguous and outlives this call (owned by the store for
+    // the tick); the array is made read-only before exposure.
+    let base = unsafe { PyArray1::borrow_from_array(col, pin.into_any()) };
+    base.call_method("setflags", (), Some(&[("write", false)].into_py_dict(py)?))?;
+    Ok(base.into_any())
+}
+
 fn bulk_count_view<'py>(py: Python<'py>, count: &Array1<i64>) -> PyResult<Bound<'py, PyAny>> {
     if count.as_slice().is_none() {
         // Non-contiguous (never produced by M1 loaders): fall back to a copy.
@@ -468,14 +770,20 @@ pub fn build_view<'py>(
 }
 
 /// Convert the whole final [`State`] to a Python dict (plain columns; the parity
-/// test compares this against the pb `Composite.state`).
-pub fn state_to_py<'py>(py: Python<'py>, state: &State) -> PyResult<Bound<'py, PyDict>> {
-    let empty = DtypeMap::new();
+/// test compares this against the pb `Composite.state`). `dtypes` carries the
+/// live-object handle table so handle paths return the same Python objects pb
+/// holds (e.g. the `(instance,)` process store, `allocator_rng`); it has no
+/// handles on the JSON `run` path.
+pub fn state_to_py<'py>(
+    py: Python<'py>,
+    state: &State,
+    dtypes: &DtypeMap,
+) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let mut path = Vec::new();
     for (k, n) in &state.root {
         path.push(k.clone());
-        d.set_item(k, storenode_to_py(py, n, &path, &empty, false)?)?;
+        d.set_item(k, storenode_to_py(py, n, &path, dtypes, false)?)?;
         path.pop();
     }
     Ok(d)
@@ -519,14 +827,71 @@ fn parse_leaf_type(s: &str) -> Type {
 
 /// Walk a returned update value against the output schema, appending typed
 /// [`PortUpdate`]s. `port_path` accumulates the (sub-)port keys.
+///
+/// `view`/`dtypes` implement the M5 Task 2 handle drop: a write whose port
+/// resolves (through the input wires, which carry the handle port too — the
+/// `process` port is read AND written) to a live-object store path is DROPPED.
+/// The handle is the same shared object, already mutated in place, so the value
+/// write is a no-op; the Requester→Evolver ordering edge is static wiring and is
+/// unaffected (only the runtime value is skipped, never the wire).
 pub fn translate_update(
     update: &Bound<'_, PyAny>,
     schema: &OutSchema,
     port_path: &mut Vec<String>,
     out: &mut Vec<PortUpdate>,
+    view: &PortView<'_>,
+    dtypes: &DtypeMap,
 ) -> PyResult<()> {
     match schema {
         OutSchema::Leaf(ty) => {
+            if !dtypes.handles.is_empty() {
+                let refs: Vec<&str> = port_path.iter().map(String::as_str).collect();
+                if let Some(abs) = view.path(&refs) {
+                    if dtypes.handles.contains_key(&abs) {
+                        return Ok(()); // drop: no-op write to a handle path
+                    }
+                }
+            }
+            // An empty dict is a no-op update in pb (no keys to project), whatever
+            // the port type — e.g. a unique-molecule port (`oriCs: 'oriC'`) that
+            // emits `{}` on a tick with no set/add/delete. Emit nothing, rather
+            // than an `Op::Overwrite({})` that would clobber (or type-mismatch
+            // against) the target store.
+            if let Ok(dict) = update.cast::<PyDict>() {
+                if dict.is_empty() {
+                    return Ok(());
+                }
+            }
+            // A dict written to a container-typed port (`map[T]`, `tree[T]`, or an
+            // untyped `node`) targets a NESTED store, not a leaf. pb projects such
+            // an update through the store schema, applying each leaf by its own
+            // type; a single wholesale `Op::Overwrite` at the node would instead be
+            // an op/store type mismatch against the tree (and would not merge). So
+            // recurse per key, typing each element by the container's element type:
+            // `map[float]` -> additive float per key (e.g. `environment.exchange`),
+            // `map[overwrite[float]]`/untyped `node` -> overwrite per leaf (e.g.
+            // `environment.exchange_data`, the nested listener dicts). This closes
+            // M5 known-unknown (b) (non-overwrite nested outputs on the `_` arm).
+            if let Some(inner) = container_inner_type(ty) {
+                if !is_unique_update(update)? {
+                    if let Ok(dict) = update.cast::<PyDict>() {
+                        for (k, v) in dict.iter() {
+                            let key = k.str()?.to_str()?.to_string();
+                            port_path.push(key);
+                            translate_update(
+                                &v,
+                                &OutSchema::Leaf(inner.clone()),
+                                port_path,
+                                out,
+                                view,
+                                dtypes,
+                            )?;
+                            port_path.pop();
+                        }
+                        return Ok(());
+                    }
+                }
+            }
             let op = op_from_type(ty, update)?;
             if let Some(op) = op {
                 out.push(PortUpdate {
@@ -542,13 +907,26 @@ pub fn translate_update(
             for (key, sub) in entries {
                 if let Some(v) = dict.get_item(key)? {
                     port_path.push(key.clone());
-                    translate_update(&v, sub, port_path, out)?;
+                    translate_update(&v, sub, port_path, out, view, dtypes)?;
                     port_path.pop();
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The element type to recurse into for a dict written to a nested-store port.
+/// `map[T]`/`tree[T]` carry an explicit element type; an untyped `node` tree
+/// recurses as `node` so each leaf becomes an `Op::Overwrite` (the pb default
+/// merge). Returns `None` for a genuine leaf type (handled by [`op_from_type`]).
+fn container_inner_type(ty: &Type) -> Option<Type> {
+    match ty {
+        Type::Map { value } => Some((**value).clone()),
+        Type::Tree { leaf } => Some((**leaf).clone()),
+        Type::Node => Some(Type::Node),
+        _ => None,
+    }
 }
 
 /// Map a (type, Python value) to the Rust [`Op`]. Returns `None` for a no-op.
@@ -558,7 +936,7 @@ fn op_from_type(ty: &Type, value: &Bound<'_, PyAny>) -> PyResult<Option<Op>> {
         Type::Integer { .. } => Op::IntDelta(value.extract::<i64>()? as i128),
         Type::String => Op::SetStr(value.str()?.to_str()?.to_string()),
         Type::Boolean => Op::SetBool(value.is_truthy()?),
-        Type::Overwrite(_) => Op::Overwrite(py_to_value(value)?),
+        Type::Overwrite(_) => Op::Overwrite(overwrite_value(value)?),
         Type::BulkArray { .. } => bulk_op(value)?,
         Type::UniqueArray { .. } => unique_op(value)?,
         // Named/other: detect a unique-update dict by shape, else overwrite.
@@ -566,11 +944,25 @@ fn op_from_type(ty: &Type, value: &Bound<'_, PyAny>) -> PyResult<Option<Op>> {
             if is_unique_update(value)? {
                 unique_op(value)?
             } else {
-                Op::Overwrite(py_to_value(value)?)
+                Op::Overwrite(overwrite_value(value)?)
             }
         }
     };
     Ok(Some(op))
+}
+
+/// Lower a leaf value being STORED (an `Op::Overwrite` payload) to a [`Value`],
+/// preserving a plain numpy ndarray as a `__numpy__` tag so it round-trips as an
+/// ndarray (view + final state) rather than decaying to a Python list — e.g. a
+/// process rewriting `ppgpp_state.basal_prob` / a listener array each tick.
+/// (Only on the store-value path: `bulk_op`/`unique_op` keep the plain
+/// [`py_to_value`] so the arrays INSIDE their `(idx, delta)` / field dicts parse
+/// as arrays, not as tagged scalars.) Closes M5 known-unknown (a).
+fn overwrite_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
+    if is_plain_ndarray(value)? {
+        return ndarray_to_value(value);
+    }
+    py_to_value(value)
 }
 
 fn is_unique_update(value: &Bound<'_, PyAny>) -> PyResult<bool> {

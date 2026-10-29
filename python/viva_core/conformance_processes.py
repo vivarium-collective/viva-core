@@ -522,3 +522,245 @@ class UniqueReallocProbe(EcoliProcess):
             "snap_active_sum": snap["active_sum"],
         })
         return {}
+
+
+# --------------------------------------------------------------------------- #
+# M5 unit bridge: a process that WRITES pint Quantities (exercising the
+# py_to_value Quantity arm via overwrite ops) and READS them back across ticks
+# (exercising the value_to_py Pint arm on an input view) — the write->read
+# round-trip that the `effective_elongation_rate` strict read depends on.
+# --------------------------------------------------------------------------- #
+
+# Per-tick record of what QuantityCycler READ from its (previously-written)
+# quantity stores: type, is-Quantity, magnitude dtype, and whether the strict
+# `.to(<unit>)` read succeeded. Cleared by the test before each run.
+QUANTITY_READ_LOG: list = []
+
+
+class QuantityCycler(EcoliProcess):
+    """Fixed-timestep process that each tick READS four quantity stores (as an
+    input view) and WRITES fresh pint Quantities back to the SAME stores.
+
+    * The writes are ``pint.Quantity`` values returned on ``overwrite[...]``
+      ports -> the Rust ``op_from_type`` routes each to ``Op::Overwrite`` and
+      calls ``py_to_value`` on the Quantity (the arm that, pre-M5, either
+      infinite-recursed on an ``np.float64`` magnitude or dropped a Python-float
+      magnitude to ``Null``).
+    * Because inputs and outputs wire to the same stores, on tick ``t+1`` the
+      input view is exactly what was written on tick ``t`` -> each read goes
+      through ``value_to_py`` on a ``Value::Tagged(Pint, ..)`` leaf. This is the
+      write->read-across-ticks path the strict ``effective_elongation_rate`` read
+      (PolypeptideElongation -> PolypeptideInitiation) relies on.
+
+    Magnitudes are fixed np.float64 values (plus one Python-float store) so the
+    final state is deterministic and the ``np.float64`` vs ``float`` distinction
+    is observable. The ``zero_mass`` store is zero so ``1 / q`` must give ``inf``
+    (np.float64) rather than raising ``ZeroDivisionError`` (Python float).
+
+    Output schema units: ``femtogram`` is a bare symbol and parses as
+    ``quantity[float,femtogram]``; the non-bare units (``1 / second``,
+    ``amino_acid / second``) are declared ``overwrite[float]`` since the Rust
+    ``op_from_type`` ignores an Overwrite's inner type — the real unit travels on
+    the Quantity value, not the schema.
+    """
+
+    name = "quantity_cycler"
+    config_schema = {}
+
+    # port -> the unit string the written Quantity carries (and the unit the
+    # strict read converts to via `.to(...)`).
+    UNITS = {
+        "mass": "femtogram",
+        "rate": "1 / second",
+        "eff_rate": "amino_acid / second",
+        "zero_mass": "femtogram",
+        "py_mass": "femtogram",
+    }
+
+    def inputs(self):
+        return {port: "float" for port in self.UNITS}
+
+    def outputs(self):
+        return {
+            "mass": "overwrite[quantity[float,femtogram]]",
+            "zero_mass": "overwrite[quantity[float,femtogram]]",
+            "py_mass": "overwrite[quantity[float,femtogram]]",
+            "rate": "overwrite[float]",
+            "eff_rate": "overwrite[float]",
+        }
+
+    def calculate_timestep(self, interval_or_states, states=None):
+        return float(self.parameters.get("dt", 1.0))
+
+    def update(self, state, interval=None):
+        import pint
+        from bigraph_schema.units import get_quantity_registry
+
+        ureg = get_quantity_registry()
+        rec = {}
+        for port, unit in self.UNITS.items():
+            v = state.get(port)
+            info = {"type": type(v).__name__,
+                    "is_quantity": isinstance(v, pint.Quantity)}
+            if info["is_quantity"]:
+                info["mag_dtype"] = type(v.magnitude).__name__
+                try:
+                    info["mag"] = float(v.to(unit).magnitude)  # the strict read
+                    info["to_ok"] = True
+                except Exception as exc:  # noqa: BLE001
+                    info["to_ok"] = False
+                    info["err"] = repr(exc)
+            rec[port] = info
+        QUANTITY_READ_LOG.append(rec)
+
+        return {
+            "mass": ureg.Quantity(np.float64(5.0), "femtogram"),
+            "rate": ureg.Quantity(np.float64(2.0), "1 / second"),
+            "eff_rate": ureg.Quantity(np.float64(1.2345), "amino_acid / second"),
+            "zero_mass": ureg.Quantity(np.float64(0.0), "femtogram"),
+            "py_mass": ureg.Quantity(3.0, "femtogram"),  # Python-float magnitude
+        }
+
+
+# --------------------------------------------------------------------------- #
+# M5 handle table: the live process-as-data store (`process`) + `allocator_rng`.
+#
+# Faithful, sim_data-free stand-ins for v2ecoli's partitioned execution layer
+# (`steps/partition.py` Requester/Evolver + `steps/allocator.py` Allocator): a
+# `process` store holds the SAME live object (a 1-tuple `(instance,)`, port type
+# `quote`) that a Requester mutates in place and an Evolver then reads, and an
+# `allocator_rng` store holds a live `numpy.random.RandomState` (port type
+# `random_state`) the Allocator draws from in place. Neither can cross the JSON
+# state channel; both must travel as Python-owned handles. These classes run
+# UNCHANGED under both pb 1.8.3 (`Composite`) and the Rust engine
+# (`run_prebuilt`), so the handle mechanism is proven bit-identical.
+# --------------------------------------------------------------------------- #
+
+# Per-call record of what the handle steps were handed: object id()s (identity),
+# the shared counter the Requester mutates in place, and the Allocator's RNG
+# draws (the stream). Cleared by the test before each run.
+HANDLE_LOG: list = []
+
+# Records every attempt to LOWER the live `process` handle across the boundary
+# (``convert.rs::py_to_value``'s numpy fallback calls ``.tolist()``). The handle
+# DROP at the update boundary means a handle-path write is never lowered, so this
+# stays empty; if the drop were removed, the engine would call ``py_to_value`` on
+# the ``(instance,)`` tuple each tick and this would fire. Observing it is the
+# only signal BELOW the re-insertion mask (the view boundary and ``state_to_py``
+# both re-insert the live handle, hiding any corrupted stored leaf), so this is
+# what makes the drop test non-vacuous. Cleared by the test before each run.
+HANDLE_SERIALIZE_LOG: list = []
+
+
+class PartitionedHandle:
+    """The live object carried by the `process` store as `(instance,)` — the
+    stand-in for a v2ecoli `PartitionedProcess`. Holds mutable state
+    (`counter`, `request_set`) that the Requester mutates IN PLACE, so the
+    Evolver reading the SAME object observes the mutation. A copy (or a decoded
+    placeholder) would lose this — exactly what the handle table must prevent."""
+
+    def __init__(self):
+        self.counter = 0
+        self.request_set = False
+
+    def calculate_request(self):
+        self.counter += 1
+        self.request_set = True
+        return self.counter
+
+    def tolist(self):
+        """Serialization probe (NOT part of the partition contract). ``py_to_value``
+        tries ``.tolist()`` when lowering an unknown object; a correct handle drop
+        means this live object is never lowered, so this must never be called. If
+        it is, the update boundary serialized a handle-path write — the bug the
+        drop prevents."""
+        HANDLE_SERIALIZE_LOG.append(id(self))
+        return []
+
+
+class HandleRequester(EcoliStep):
+    """Layer-0 step (fired by `global_time`). Reads the live `process` object,
+    mutates it in place (`calculate_request` bumps `counter`), emits a `request`
+    for the Allocator, advances `next_update_time` so the clock keeps ticking,
+    and writes the SAME object back on the `process` port (a no-op overwrite the
+    Rust handle boundary DROPS — the object is shared and already mutated)."""
+
+    config_schema = {}
+
+    def inputs(self):
+        return {"process": "quote", "global_time": "float"}
+
+    def outputs(self):
+        return {"request": "overwrite[integer]", "process": "quote",
+                "next_update_time": "overwrite[float]"}
+
+    def update(self, state, interval=None):
+        proc_state = state["process"]
+        obj = proc_state[0]
+        value = obj.calculate_request()
+        HANDLE_LOG.append({"step": "requester", "obj_id": id(obj),
+                           "is_tuple": isinstance(proc_state, tuple),
+                           "counter": obj.counter})
+        gt = float(state["global_time"])
+        # Advance this process' own next_update_time slot (a scalar leaf), so the
+        # clock keeps ticking — mirrors v2ecoli's per-slot write, not a whole-map
+        # overwrite.
+        return {"request": int(value), "process": (obj,),
+                "next_update_time": gt + 1.0}
+
+
+class HandleAllocator(EcoliStep):
+    """Layer-1 step (after the Requester via the `request` store). Reads the live
+    `allocator_rng` RandomState and draws from it IN PLACE (mutating the shared
+    stream — a copy would diverge), writes a `bulk` delta driven by the draw and
+    an `allocate` for the Evolver, plus a listener recording the draw sum."""
+
+    config_schema = {}
+
+    def inputs(self):
+        return {"request": "integer", "bulk": "bulk_array",
+                "allocator_rng": "random_state"}
+
+    def outputs(self):
+        return {"allocate": "overwrite[integer]", "bulk": "bulk_array",
+                "draw_sum": "overwrite[integer]"}
+
+    def update(self, state, interval=None):
+        rng = state["allocator_rng"]
+        counts = np.asarray(state["bulk"]["count"])
+        n = counts.shape[0]
+        draw = rng.randint(1, 7, size=n).astype(np.int64)  # mutates rng in place
+        HANDLE_LOG.append({"step": "allocator", "rng_id": id(rng),
+                           "draw": draw.tolist()})
+        idx = np.arange(n, dtype=np.int64)
+        return {"allocate": int(state["request"]),
+                "bulk": [(idx, draw)],
+                "draw_sum": int(draw.sum())}
+
+
+class HandleEvolver(EcoliStep):
+    """Layer-2 step (after the Allocator via the `allocate` store). Reads the
+    SAME live `process` object the Requester mutated (identity proof) and writes
+    a `bulk` delta driven by its shared `counter`, plus the no-op `process`
+    write-back."""
+
+    config_schema = {}
+
+    def inputs(self):
+        return {"process": "quote", "allocate": "integer", "bulk": "bulk_array"}
+
+    def outputs(self):
+        return {"bulk": "bulk_array", "process": "quote"}
+
+    def update(self, state, interval=None):
+        proc_state = state["process"]
+        obj = proc_state[0]
+        HANDLE_LOG.append({"step": "evolver", "obj_id": id(obj),
+                           "is_tuple": isinstance(proc_state, tuple),
+                           "counter": obj.counter,
+                           "request_set": obj.request_set})
+        counts = np.asarray(state["bulk"]["count"])
+        n = counts.shape[0]
+        idx = np.arange(n, dtype=np.int64)
+        delta = np.full(n, obj.counter, dtype=np.int64)
+        return {"bulk": [(idx, delta)], "process": (obj,)}

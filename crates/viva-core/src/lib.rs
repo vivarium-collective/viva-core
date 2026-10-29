@@ -25,7 +25,7 @@ use bigraph_schema_rs::codec;
 use bigraph_schema_rs::doc::{CompositeSpec, Map, Node, TagKind, Value};
 use bigraph_schema_rs::state::{from_initial, StoreNode};
 use process_bigraph_rs::engine::Engine;
-use process_bigraph_rs::process::Process;
+use process_bigraph_rs::process::{wire_path, Process};
 use process_bigraph_rs::registry::ProcessRegistry;
 
 mod convert;
@@ -45,6 +45,12 @@ pub struct DtypeMap {
     dtypes: HashMap<Vec<String>, Vec<(String, String)>>,
     /// Prebuilt numpy `id` array per bulk store (immutable for a run).
     pub ids: HashMap<Vec<String>, Py<PyAny>>,
+    /// Python-owned live objects per store path (M5 Task 2, same pattern/lifetime
+    /// as [`ids`]): the `(instance,)` tuple for a `["process", <name>]` store and
+    /// the `numpy.random.RandomState` for `["allocator_rng"]`. Consulted at the
+    /// view boundary ([`convert::storenode_to_py`]) — Rust NEVER serializes these;
+    /// the state JSON carries only a placeholder at these paths.
+    pub handles: HashMap<Vec<String>, Py<PyAny>>,
 }
 
 impl DtypeMap {
@@ -199,6 +205,68 @@ fn build_engine(spec: &CompositeSpec) -> PyResult<Engine> {
     Engine::with_state(spec, state, &registry).map_err(|e| perr(format!("building engine: {e}")))
 }
 
+/// Edge wire map (`inputs`/`outputs`) as a `Map<Value>`, or empty.
+fn edge_wires(w: &Option<Value>) -> Map<Value> {
+    match w {
+        Some(Value::Map(m)) => m.clone(),
+        _ => Map::new(),
+    }
+}
+
+/// Collect every leaf port path of a wire tree (the nested port-key sequences a
+/// write/read addresses).
+fn collect_leaf_ports(wires: &Map<Value>, prefix: &mut Vec<String>, out: &mut Vec<Vec<String>>) {
+    for (k, v) in wires {
+        prefix.push(k.clone());
+        match v {
+            Value::Map(m) => collect_leaf_ports(m, prefix, out),
+            _ => out.push(prefix.clone()),
+        }
+        prefix.pop();
+    }
+}
+
+/// Fail loud if any edge writes a handle path through wiring that is not
+/// symmetric between inputs and outputs.
+///
+/// The update-boundary DROP ([`convert::translate_update`]) decides whether a
+/// write targets a handle path by resolving the output port through the INPUT
+/// wires ([`PortView::path`]), whereas the engine routes the actual write through
+/// the OUTPUT wires ([`Engine::map_updates`]). That is sound ONLY because a handle
+/// port (e.g. `process`, read AND written) wires identically on both sides. This
+/// checks the invariant at build time, so an asymmetric wiring — an output port
+/// landing on a handle path whose same-port input wiring is absent or different —
+/// fails here instead of silently misrouting (and corrupting) a handle write.
+fn check_handle_wire_symmetry(
+    spec: &CompositeSpec,
+    handles: &HashMap<Vec<String>, Py<PyAny>>,
+) -> PyResult<()> {
+    for (path, edge) in spec.edges() {
+        let base = &path[..path.len().saturating_sub(1)];
+        let inputs = edge_wires(&edge.inputs);
+        let outputs = edge_wires(&edge.outputs);
+        let mut ports = Vec::new();
+        collect_leaf_ports(&outputs, &mut Vec::new(), &mut ports);
+        for port in &ports {
+            let Some(abs) = wire_path(&outputs, base, port) else {
+                continue;
+            };
+            if !handles.contains_key(&abs) {
+                continue;
+            }
+            let in_abs = wire_path(&inputs, base, port);
+            if in_abs.as_ref() != Some(&abs) {
+                return Err(perr(format!(
+                    "handle port {port:?} on edge {path:?} writes the handle path {abs:?}, \
+                     but its INPUT wiring resolves to {in_abs:?}; the update-boundary drop \
+                     keys off input wires and would miss this write (asymmetric handle wiring)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn is_emitter(address: &str) -> bool {
     address.contains("Emitter")
         || address.ends_with("ram-emitter")
@@ -215,7 +283,8 @@ fn run(py: Python<'_>, spec: &str, n_ticks: usize) -> PyResult<Py<PyDict>> {
     engine
         .run(n_ticks)
         .map_err(|e| perr(format!("running engine: {e}")))?;
-    convert::state_to_py(py, &engine.state).map(|d| d.unbind())
+    // The JSON `run` path has no live-object handles.
+    convert::state_to_py(py, &engine.state, &DtypeMap::new()).map(|d| d.unbind())
 }
 
 /// Like [`run`], but also returns the differential-gating diagnostics: the
@@ -231,7 +300,10 @@ fn run_report(py: Python<'_>, spec: &str, n_ticks: usize) -> PyResult<Py<PyDict>
         .map_err(|e| perr(format!("running engine: {e}")))?;
 
     let out = PyDict::new(py);
-    out.set_item("state", convert::state_to_py(py, &engine.state)?)?;
+    out.set_item(
+        "state",
+        convert::state_to_py(py, &engine.state, &DtypeMap::new())?,
+    )?;
 
     let step_runs = PyList::empty(py);
     for sr in &engine.step_run_log {
@@ -278,7 +350,8 @@ fn build_prebuilt_engine(
     topology: &str,
     state: &str,
     native_addresses: &[String],
-) -> PyResult<Engine> {
+    handles: Option<&Bound<'_, PyDict>>,
+) -> PyResult<(Engine, Arc<DtypeMap>)> {
     // Merge the two specs into one composite: state stores first, then the edges.
     let mut combined = load_spec(state)?;
     let topo = load_spec(topology)?;
@@ -288,6 +361,25 @@ fn build_prebuilt_engine(
     let mut st = from_initial(&combined);
     collect_bulk_ids(py, &st.root, &mut Vec::new(), &mut dtype_map)?;
     install_unique_layouts(py, &mut st.root, &mut Vec::new(), &dtype_map)?;
+    // M5 Task 2: install the Python-owned handle objects, keyed by absolute store
+    // path (the `/`-joined key from `build_payload`). Each is held as a `Py<PyAny>`
+    // and handed back verbatim at the view boundary — never serialized.
+    if let Some(handles) = handles {
+        for (key, obj) in handles.iter() {
+            let path: Vec<String> = key
+                .str()?
+                .to_str()?
+                .split('/')
+                .map(str::to_string)
+                .collect();
+            dtype_map.handles.insert(path, obj.unbind());
+        }
+    }
+    // Guard the drop's input-vs-output wire-symmetry assumption (see the function
+    // docs); a no-op when there are no handles.
+    if !dtype_map.handles.is_empty() {
+        check_handle_wire_symmetry(&combined, &dtype_map.handles)?;
+    }
     let dtypes = Arc::new(dtype_map);
 
     let registry = ProcessRegistry::with_builtin_emitters();
@@ -326,8 +418,9 @@ fn build_prebuilt_engine(
         prebuilt.insert(path, Box::new(pyproc) as Box<dyn Process>);
     }
 
-    Engine::with_prebuilt(&combined, st, &registry, prebuilt)
-        .map_err(|e| perr(format!("building prebuilt engine: {e}")))
+    let engine = Engine::with_prebuilt(&combined, st, &registry, prebuilt)
+        .map_err(|e| perr(format!("building prebuilt engine: {e}")))?;
+    Ok((engine, dtypes))
 }
 
 /// Run a composite whose processes are handed over ALREADY CONSTRUCTED (the M4
@@ -343,7 +436,7 @@ fn build_prebuilt_engine(
 /// `__structured_array__`, scalars/maps inline). `native_addresses`: addresses
 /// to swap for their native twin (also gated by `VIVA_NATIVE_PROCESSES`).
 #[pyfunction]
-#[pyo3(signature = (processes, topology, state, n_ticks, native_addresses=None))]
+#[pyo3(signature = (processes, topology, state, n_ticks, native_addresses=None, handles=None))]
 fn run_prebuilt(
     py: Python<'_>,
     processes: &Bound<'_, PyDict>,
@@ -351,13 +444,17 @@ fn run_prebuilt(
     state: &str,
     n_ticks: usize,
     native_addresses: Option<Vec<String>>,
+    handles: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyDict>> {
     let native = native_addresses.unwrap_or_default();
-    let mut engine = build_prebuilt_engine(py, processes, topology, state, &native)?;
+    let (mut engine, dtypes) =
+        build_prebuilt_engine(py, processes, topology, state, &native, handles)?;
     engine
         .run(n_ticks)
         .map_err(|e| perr(format!("running prebuilt engine: {e}")))?;
-    convert::state_to_py(py, &engine.state).map(|d| d.unbind())
+    // Pass `dtypes` so the final state re-inserts the live handle objects at their
+    // store paths (the conformance diff then sees the same objects pb carries).
+    convert::state_to_py(py, &engine.state, &dtypes).map(|d| d.unbind())
 }
 
 /// Native-GLPK FBA primitives (only when built `--features glpk`). These expose

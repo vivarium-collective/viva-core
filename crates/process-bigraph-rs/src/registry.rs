@@ -44,10 +44,28 @@ impl ProcessRegistry {
         address: &str,
         config: Option<&Value>,
     ) -> Result<Box<dyn Process>, ProcessError> {
-        let f = self
-            .factories
-            .get(address)
-            .ok_or_else(|| ProcessError(format!("no process registered for {address:?}")))?;
-        f(config)
+        if let Some(f) = self.factories.get(address) {
+            return f(config);
+        }
+        // Any emitter-addressed edge that is not an explicit builtin (e.g.
+        // `viva_emitters.parquet_emitter.ParquetEmitter`) falls back to the RAM
+        // emitter. An emitter is a read-only sink in pb — it records the state it
+        // is wired to and returns NO state updates — so substituting the RAM
+        // emitter is bit-identical for the *simulation state* (only the emitted
+        // history differs, which is out of the conformance scope). A non-emitter
+        // unknown address still errors.
+        if is_emitter_address(address) {
+            return Ok(Box::new(RamEmitter::from_config(config)));
+        }
+        Err(ProcessError(format!(
+            "no process registered for {address:?}"
+        )))
     }
+}
+
+/// Whether an address names an emitter step (mirrors `viva_core::is_emitter`).
+fn is_emitter_address(address: &str) -> bool {
+    address.contains("Emitter")
+        || address.ends_with("ram-emitter")
+        || address.ends_with("json-emitter")
 }

@@ -19,7 +19,9 @@
 //! `_triggers` rule in `schedule`), every step is downstream and fires every
 //! tick, which is what this engine does.
 
-use crate::process::{wire_path, PortUpdate, PortView, Process, ProcessError, Row};
+use crate::process::{
+    wire_path, MetadataWriteback, PortUpdate, PortView, Process, ProcessError, Row,
+};
 use crate::registry::ProcessRegistry;
 use crate::schedule::{wire_step_layers, Layer};
 use bigraph_schema_rs::apply::{apply_update, reconcile, ApplyError, Update};
@@ -229,17 +231,34 @@ impl Engine {
         Ok(())
     }
 
-    fn map_updates(slot: &Slot, ups: Vec<PortUpdate>) -> Result<Vec<Update>, EngineError> {
-        ups.into_iter()
-            .map(|u| {
-                wire_path(&slot.outputs, &slot.base, &u.port)
-                    .map(|path| Update { path, op: u.op })
-                    .ok_or_else(|| EngineError::UnwiredPort {
-                        path: slot.path.clone(),
-                        port: u.port.clone(),
-                    })
-            })
-            .collect()
+    fn map_updates(
+        state: &State,
+        slot: &Slot,
+        ups: Vec<PortUpdate>,
+    ) -> Result<Vec<Update>, EngineError> {
+        let mut out = Vec::with_capacity(ups.len());
+        for u in ups {
+            let path = wire_path(&slot.outputs, &slot.base, &u.port).ok_or_else(|| {
+                EngineError::UnwiredPort {
+                    path: slot.path.clone(),
+                    port: u.port.clone(),
+                }
+            })?;
+            // pb projects every update through the composition schema: a write
+            // whose target path is NOT in the schema is silently dropped (e.g.
+            // `ecoli-equilibrium` returns `listeners.equilibrium_listener.*`,
+            // which is not a field of the `listeners` store, so pb ignores it).
+            // The decoded state carries exactly the schema's leaves (dynamic
+            // `map`/`tree` keys such as `environment.exchange.*` are pre-seeded in
+            // the initial state), so "path exists in state" is the faithful proxy:
+            // keep writes to existing paths, drop writes to absent ones. This
+            // matches pb's drop AND avoids a spurious PathNotFound in apply.
+            let refs: Vec<&str> = path.iter().map(String::as_str).collect();
+            if state.get(&refs).is_some() {
+                out.push(Update { path, op: u.op });
+            }
+        }
+        Ok(out)
     }
 
     fn calc_interval(state: &State, slot: &mut Slot, configured: f64) -> Result<f64, EngineError> {
@@ -251,14 +270,23 @@ impl Engine {
         Ok(slot.process.calculate_timestep(&view, configured)?)
     }
 
-    fn invoke(state: &State, slot: &mut Slot, dt: f64) -> Result<Vec<Update>, EngineError> {
+    /// Returns the process' store updates AND any unique-index counter
+    /// write-backs it produced (pb's in-place `create_unique_indices` bumps; see
+    /// [`Process::take_metadata_writebacks`]), as `(absolute path, delta)` pairs.
+    fn invoke(
+        state: &State,
+        slot: &mut Slot,
+        dt: f64,
+    ) -> Result<(Vec<Update>, Vec<MetadataWriteback>), EngineError> {
         let view = PortView {
             state,
             wires: &slot.inputs,
             base: &slot.base,
         };
         let ups = slot.process.update(&view, dt)?;
-        Self::map_updates(slot, ups)
+        let meta = slot.process.take_metadata_writebacks();
+        let updates = Self::map_updates(state, slot, ups)?;
+        Ok((updates, meta))
     }
 
     fn apply_all(&mut self, updates: Vec<Update>) -> Result<(), EngineError> {
@@ -277,6 +305,7 @@ impl Engine {
         let gt = self.global_time()?;
         for li in 0..self.layers.len() {
             let mut updates = Vec::new();
+            let mut meta_writebacks: Vec<MetadataWriteback> = Vec::new();
             for si in 0..self.layers[li].steps.len() {
                 let idx = self.step_index[&self.layers[li].steps[si].path];
                 let ran = {
@@ -295,10 +324,21 @@ impl Engine {
                 });
                 if ran {
                     // Steps are invoked with interval = -1.0.
-                    updates.extend(Self::invoke(&self.state, &mut self.steps[idx], -1.0)?);
+                    let (ups, meta) = Self::invoke(&self.state, &mut self.steps[idx], -1.0)?;
+                    updates.extend(ups);
+                    meta_writebacks.extend(meta);
                 }
             }
             self.apply_all(updates)?;
+            // Replay unique-index counter bumps the steps' `create_unique_indices`
+            // calls made in place on their views (pb mutates the shared store
+            // array; the handoff view is detached). Applied after the layer's
+            // store updates and before the next layer — so a later-layer flush's
+            // auto-numbered add sees the advanced counter, as under pb.
+            for (path, delta) in meta_writebacks {
+                bigraph_schema_rs::apply::add_unique_metadata(&mut self.state, &path, delta)
+                    .map_err(EngineError::from)?;
+            }
         }
         Ok(())
     }
@@ -329,10 +369,24 @@ impl Engine {
                     full_step = interval;
                 }
                 if future <= end_time {
-                    let update = Self::invoke(&self.state, &mut self.processes[i], dt)?;
-                    let slot = &mut self.processes[i];
-                    slot.front_time = future;
-                    slot.pending = update;
+                    let (update, meta) = Self::invoke(&self.state, &mut self.processes[i], dt)?;
+                    {
+                        let slot = &mut self.processes[i];
+                        slot.front_time = future;
+                        slot.pending = update;
+                    }
+                    // A process' `create_unique_indices` bump is immediate under pb
+                    // (shared array), so apply its counter write-backs now, not with
+                    // the deferred `pending` update. (No in-scope process does this,
+                    // so this is normally empty.)
+                    for (path, delta) in meta {
+                        bigraph_schema_rs::apply::add_unique_metadata(
+                            &mut self.state,
+                            &path,
+                            delta,
+                        )
+                        .map_err(EngineError::from)?;
+                    }
                 }
             } else {
                 let delay = front_time - gt;

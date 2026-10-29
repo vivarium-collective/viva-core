@@ -92,6 +92,31 @@ pub fn apply_update(state: &mut State, updates: &[Update]) -> Result<(), ApplyEr
     Ok(())
 }
 
+/// Apply a per-process unique-index counter write-back: `store.metadata += delta`.
+///
+/// pb's `create_unique_indices` bumps the unique store's `.metadata` IN PLACE on
+/// the array a process reads, so a later auto-numbered add (and the next process)
+/// sees the advanced counter. The PyO3 handoff gives each process a detached
+/// `MetadataArray` view, so that in-place bump is read back after the process runs
+/// (see `Process::take_metadata_writebacks`) and replayed here against the store.
+pub fn add_unique_metadata(
+    state: &mut State,
+    path: &[String],
+    delta: i128,
+) -> Result<(), ApplyError> {
+    if delta == 0 {
+        return Ok(());
+    }
+    let node = state
+        .get_mut_path(path)
+        .ok_or_else(|| ApplyError::PathNotFound(path.to_vec()))?;
+    let StoreNode::Unique(store) = node else {
+        return Err(ApplyError::TypeMismatch(path.to_vec()));
+    };
+    store.metadata += delta;
+    Ok(())
+}
+
 fn apply_one(node: &mut StoreNode, op: &Op, path: &[String]) -> Result<(), ApplyError> {
     match op {
         Op::BulkDelta(deltas) => {
@@ -132,7 +157,7 @@ fn apply_one(node: &mut StoreNode, op: &Op, path: &[String]) -> Result<(), Apply
         }
         Op::SetStr(s) => replace_leaf(node, Value::Str(s.clone()), path)?,
         Op::SetBool(b) => replace_leaf(node, Value::Bool(*b), path)?,
-        Op::Overwrite(val) => replace_leaf(node, val.clone(), path)?,
+        Op::Overwrite(val) => replace_node(node, val, path)?,
         Op::Unique(u) => {
             let StoreNode::Unique(store) = node else {
                 return Err(ApplyError::TypeMismatch(path.to_vec()));
@@ -152,6 +177,41 @@ fn replace_leaf(node: &mut StoreNode, val: Value, path: &[String]) -> Result<(),
     };
     *v = val;
     Ok(())
+}
+
+/// `apply(Overwrite)` for any non-columnar node: a `Leaf` takes the new value; a
+/// `Branch` is REPLACED wholesale (pb `overwrite[map[...]]` — e.g. a Requester
+/// rewriting `request.<process>` each tick — swaps the whole subtree, so stale
+/// keys are dropped, not merged). A `Value::Map` rebuilds a `Branch` so later
+/// per-key reads/writes still resolve; other values become a `Leaf`. Bulk/Unique
+/// stores are never plain-overwritten (they take their own op kinds).
+fn replace_node(node: &mut StoreNode, val: &Value, path: &[String]) -> Result<(), ApplyError> {
+    match node {
+        StoreNode::Leaf(v) => {
+            *v = val.clone();
+            Ok(())
+        }
+        StoreNode::Branch(_) => {
+            *node = node_from_value(val);
+            Ok(())
+        }
+        _ => Err(ApplyError::TypeMismatch(path.to_vec())),
+    }
+}
+
+/// Build a [`StoreNode`] tree from a decoded [`Value`]: a `Map` becomes a
+/// `Branch` (recursively), anything else a `Leaf`.
+fn node_from_value(val: &Value) -> StoreNode {
+    match val {
+        Value::Map(m) => {
+            let mut b = crate::doc::Map::new();
+            for (k, v) in m {
+                b.insert(k.clone(), node_from_value(v));
+            }
+            StoreNode::Branch(b)
+        }
+        other => StoreNode::Leaf(other.clone()),
+    }
 }
 
 // ---- unique updater -------------------------------------------------------
@@ -208,6 +268,20 @@ fn flush_unique(store: &mut UniqueStore, path: &[String]) -> Result<(), ApplyErr
         let free = store.get_free_indices(n_new);
         let itemsize = store.layout.itemsize;
 
+        // Assign `unique_index` from the counter and advance it ONLY when the add
+        // does NOT supply `unique_index`, exactly as pb's `UniqueNumpyUpdater`:
+        //
+        //   if "unique_index" not in add_update:
+        //       result["unique_index"][free] = arange(n_new) + result.metadata
+        //       result.metadata += n_new
+        //
+        // When a process PRE-numbers (supplies `unique_index`, e.g. via
+        // `create_unique_indices`), pb does NOT bump the store counter here — the
+        // bump already happened in-place on the view the process read, and that is
+        // reproduced by the per-process metadata write-back in the engine (see
+        // `Engine::invoke` / `Process::take_metadata_writebacks`). Bumping again
+        // here would double-count (the earlier behavior left `active_RNAP.metadata`
+        // at base+Σn_pre-numbered instead of pb's unchanged value).
         if !add.contains_key("unique_index") {
             let base = store.metadata;
             if let Some(fl) = store.layout.field("unique_index").cloned() {
