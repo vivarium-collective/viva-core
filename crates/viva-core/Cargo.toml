@@ -3,7 +3,7 @@ name = "viva-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "PyO3 wheel: the Rust process-bigraph engine running real v2ecoli .pbg models with Python processes (quadrant 3)"
+description = "General-purpose Rust process-bigraph engine (bigraph-schema + process-bigraph) as a PyO3 wheel; runs process-bigraph models with Python processes, bit-identical to pb 1.8.3; validated on real v2ecoli models"
 
 [lib]
 name = "_native"
@@ -12,13 +12,6 @@ crate-type = ["cdylib", "rlib"]
 # it is exercised through `python/tests` under `.venv-m1`, not `cargo test`.
 test = false
 doctest = false
-
-[features]
-# Native metabolism FBA solve links GLPK (a hard C dependency). OFF by default
-# so the wheel builds without GLPK; enable with `maturin develop --features glpk`
-# (GLPK headers/lib at /opt/homebrew, overridable via GLPK_LIB_DIR). build.rs
-# only emits link flags when this feature is on.
-glpk = []
 
 [dependencies]
 bigraph-schema-rs = { path = "../bigraph-schema-rs" }

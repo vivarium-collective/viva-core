@@ -52,7 +52,6 @@ from v2ecoli.composites.ecoli_baseline import baseline, load_cache_bundle  # noq
 from v2ecoli.core import build_core  # noqa: E402
 from v2ecoli.library.ecoli_step import set_current_core  # noqa: E402
 
-PD_ADDR = "local:v2ecoli.processes.protein_degradation.ProteinDegradation"
 CACHE = os.environ.get("V2ECOLI_CACHE", "/Users/eranagmon/code/v2ecoli/out/cache")
 
 core = build_core()
@@ -97,19 +96,13 @@ def _best(fn, reps=5):
     return min(fn() for _ in range(reps))
 
 
-# ---- bit-identity gate (OFF + ON vs pb) before timing --------------------- #
+# ---- bit-identity gate (run_prebuilt vs pb) before timing --------------------- #
 def _check_bit_identical(n=15):
     ref_sim = Composite({"state": copy.deepcopy(_pd_doc())}, core=core)
     ref_sim.run(float(n))
     ref = _bulk(ref_sim.state)
     off = _bulk(prebuilt.run_from_state(_pd_doc(), n_ticks=n))
-    os.environ["VIVA_NATIVE_PROCESSES"] = "ProteinDegradation"
-    try:
-        on = _bulk(prebuilt.run_from_state(_pd_doc(), n_ticks=n, native_addresses=[PD_ADDR]))
-    finally:
-        os.environ.pop("VIVA_NATIVE_PROCESSES", None)
     assert off == ref, "run_prebuilt native-OFF diverged from pb"
-    assert on == ref, "run_prebuilt native-ON diverged from pb"
     changed = int(np.count_nonzero(np.array(ref) - np.array(_bulk(_pd_doc()))))
     return changed
 
@@ -135,18 +128,11 @@ def _pb_pd_per_tick(n1=100, n2=600):
     return (t2 - t1) / (n2 - n1), t1 - (t2 - t1) / (n2 - n1) * n1
 
 
-def _hand_pd_per_tick(native, n1=100, n2=600):
-    nat = [PD_ADDR] if native else None
-
+def _hand_pd_per_tick(n1=100, n2=600):
     def run_to(n):
         doc = _pd_doc()
-        if native:
-            os.environ["VIVA_NATIVE_PROCESSES"] = "ProteinDegradation"
-        try:
-            procs, tj, sj, handles = prebuilt.build_payload(doc, nat)
-            t = time.time(); viva_core.run_prebuilt(procs, tj, sj, n, nat, handles); return time.time() - t
-        finally:
-            os.environ.pop("VIVA_NATIVE_PROCESSES", None)
+        procs, tj, sj, handles = prebuilt.build_payload(doc, None)
+        t = time.time(); viva_core.run_prebuilt(procs, tj, sj, n, None, handles); return time.time() - t
     run_to(n2)
     t1 = _best(lambda: run_to(n1)); t2 = _best(lambda: run_to(n2))
     per = (t2 - t1) / (n2 - n1)
@@ -160,7 +146,7 @@ def main():
     print("=" * 72)
 
     changed = _check_bit_identical()
-    print(f"\n[gate] ProteinDegradation OFF & ON bit-identical to pb "
+    print(f"\n[gate] ProteinDegradation bit-identical to pb "
           f"({changed} bulk counts moved) — PASS\n")
 
     pb_wm = _pb_wholemodel_per_tick()
@@ -172,23 +158,12 @@ def main():
     print("                        See docs/milestone-4-results.md.\n")
 
     pb_pd, pb_realize = _pb_pd_per_tick()
-    off, off_build = _hand_pd_per_tick(False)
-    on, on_build = _hand_pd_per_tick(True)
+    off, off_build = _hand_pd_per_tick()
     print("(B) ProteinDegradation @ full baseline scale (16321-wide real bulk)")
     print(f"    pb 1.8.3          : {pb_pd*1000:8.4f} ms/tick   {1/pb_pd:9.1f} ticks/s")
-    print(f"    run_prebuilt OFF  : {off*1000:8.4f} ms/tick   {1/off:9.1f} ticks/s   "
+    print(f"    run_prebuilt      : {off*1000:8.4f} ms/tick   {1/off:9.1f} ticks/s   "
           f"x{pb_pd/off:.2f} vs pb   (engine-build {off_build*1000:.0f}ms once)")
-    print(f"    run_prebuilt ON   : {on*1000:8.4f} ms/tick   {1/on:9.1f} ticks/s   "
-          f"x{pb_pd/on:.2f} vs pb   (engine-build {on_build*1000:.0f}ms once)")
-    print(f"    native ON vs OFF  : x{off/on:.2f} per-tick\n")
 
     print("Honest reading:")
     print(f"  * Python-on-Rust (OFF) is {'slower' if off > pb_pd else 'faster'} than pb "
           f"(x{pb_pd/off:.2f}); the engine boundary costs more than in-process Python.")
-    print(f"  * the NATIVE port (ON) is x{pb_pd/on:.2f} vs pb — the real win is the port.")
-    print("  * with 1 of ~55 processes ported, a whole-model run today would be")
-    print("    dominated by OFF-class Python processes -> projected < 1x vs pb.")
-
-
-if __name__ == "__main__":
-    main()

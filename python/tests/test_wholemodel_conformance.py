@@ -8,8 +8,7 @@ to process-bigraph 1.8.3 — and exactly where it does not.
 What runs bit-identical (and is gated here):
   * the real, full-scale ``ProteinDegradation`` process (16321-wide real bulk,
     real sim_data degradation rates + per-process seeded RNG), driven for N ticks,
-    under run_prebuilt native-swap OFF (Python instance on the Rust engine) AND ON
-    (the M3 native Rust twin, config sourced from the live instance).
+    under run_prebuilt (Python instance on the Rust engine).
 
 What does NOT yet run (recorded precisely, not faked):
   * the *whole* 46-edge agent cannot be handed over through the JSON state channel.
@@ -42,7 +41,6 @@ from v2ecoli.core import build_core
 from v2ecoli.library.ecoli_step import set_current_core
 from viva_core.conformance_processes import TickTrigger
 
-PD_ADDR = "local:v2ecoli.processes.protein_degradation.ProteinDegradation"
 CACHE = os.environ.get("V2ECOLI_CACHE", "/Users/eranagmon/code/v2ecoli/out/cache")
 
 pytestmark = pytest.mark.skipif(
@@ -116,16 +114,7 @@ def pd_results(ctx):
     init = _bulk(_pd_doc(core, bundle))
 
     off = _bulk(prebuilt.run_from_state(_pd_doc(core, bundle), n_ticks=n))
-    on = _bulk(_run_native(_pd_doc(core, bundle), n))
-    return {"ref": ref, "init": init, "off": off, "on": on, "n": n}
-
-
-def _run_native(doc, n):
-    os.environ["VIVA_NATIVE_PROCESSES"] = "ProteinDegradation"
-    try:
-        return prebuilt.run_from_state(doc, n_ticks=n, native_addresses=[PD_ADDR])
-    finally:
-        os.environ.pop("VIVA_NATIVE_PROCESSES", None)
+    return {"ref": ref, "init": init, "off": off, "n": n}
 
 
 def test_real_pd_actually_degrades(pd_results):
@@ -138,31 +127,6 @@ def test_real_pd_actually_degrades(pd_results):
 def test_native_off_bit_identical(pd_results):
     """Python ProteinDegradation on the Rust engine == pb, bit-identical, N ticks."""
     assert pd_results["off"] == pd_results["ref"]
-
-
-def test_native_on_bit_identical(pd_results):
-    """The M3 native Rust ProteinDegradation (config sourced from the live
-    instance) == pb, bit-identical — RNG-exact across N ticks."""
-    assert pd_results["on"] == pd_results["ref"]
-
-
-def test_native_path_is_actually_native(ctx):
-    """Native-ON must not call back into the Python process."""
-    core, bundle = ctx
-    from v2ecoli.processes.protein_degradation import ProteinDegradation as PD
-
-    def _poison(self, *a, **k):
-        raise AssertionError("Python ProteinDegradation.update called on native path")
-
-    orig = PD.update
-    PD.update = _poison
-    try:
-        got = _bulk(_run_native(_pd_doc(core, bundle), 5))
-    finally:
-        PD.update = orig
-    ref_sim = Composite({"state": copy.deepcopy(_pd_doc(core, bundle))}, core=core)
-    ref_sim.run(5.0)
-    assert got == _bulk(ref_sim.state)
 
 
 # --------------------------------------------------------------------------- #
