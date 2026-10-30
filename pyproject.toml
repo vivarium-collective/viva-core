@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "viva_core"
 requires-python = ">=3.10"
-description = "Rust process-bigraph engine (bigraph-schema + process-bigraph) as a PyO3 wheel; runs real v2ecoli .pbg models with Python processes, bit-identical to pb 1.8.3"
+description = "General-purpose Rust process-bigraph engine (bigraph-schema + process-bigraph) as a PyO3 wheel; runs process-bigraph models with Python processes, bit-identical to pb 1.8.3; validated on real v2ecoli models"
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
